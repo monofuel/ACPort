@@ -1,2 +1,9 @@
-## Nim library for Agent Client Protocol clients and agents.
-## This package currently contains the project foundation only.
+## Threaded Agent Client Protocol clients and agents over Linux stdio.
+
+when not defined(linux):
+  {.error: "ACPort 1.0 stdio transport currently supports Linux only.".}
+
+import
+  acport/[api, protocol]
+
+export api, protocol
