@@ -6,3 +6,4 @@ license     = "MIT"
 srcDir = "src"
 
 requires "nim >= 2.0.0"
+requires "jsony >= 1.1.6"

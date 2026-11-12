@@ -16,7 +16,8 @@ management belong in applications such as Scriptorium.
 
 Requires Nim 2.0 or newer, Nimby 0.2.3 or newer, and Make.
 Use Nimby for dependencies; the `.nimble` file provides package metadata.
-There are currently no package dependencies, so `nimby.lock` is empty.
+The JSON serialization dependency is [jsony](https://github.com/treeform/jsony).
+Its revision is pinned in `nimby.lock`.
 
 Create a workspace in the parent of the checkout:
 
