@@ -1,0 +1,11 @@
+# Nimby generates workspace dependency paths locally.
+/nim.cfg
+
+# Local compiler output and logs.
+/bin/
+/build/
+*.exe
+*.pdb
+*.ilk
+*.out
+*.log
