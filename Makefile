@@ -1,4 +1,4 @@
-.PHONY: setup check test test-arc test-orc integration-setup integration-test examples build/fixture-agent build/raw-agent
+.PHONY: setup check test test-arc test-orc integration-setup integration-test examples build/fixture-agent build/raw-agent build/session-agent
 
 NIM ?= nim
 
@@ -16,9 +16,14 @@ build/raw-agent: tests/fixtures/raw_agent.nim
 	mkdir -p build
 	$(NIM) c --out:$@ $<
 
-test: build/fixture-agent build/raw-agent
+build/session-agent: tests/fixtures/session_agent.nim src/acport.nim src/acport/*.nim
+	mkdir -p build
+	$(NIM) c --out:$@ $<
+
+test: build/fixture-agent build/raw-agent build/session-agent
 	$(NIM) r --out:build/test_protocol tests/test_protocol.nim
 	$(NIM) r --out:build/test_stdio tests/test_stdio.nim
+	$(NIM) r --out:build/test_sessions tests/test_sessions.nim
 
 test-arc:
 	ACPORT_TEST_MM=arc $(MAKE) test

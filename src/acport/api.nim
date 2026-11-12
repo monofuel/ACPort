@@ -1,6 +1,6 @@
 import
-  std/[json, os, strtabs],
-  ./[connection, processes, protocol]
+  std/[json, options, os, strtabs],
+  ./[connection, processes, protocol, session_protocol]
 
 export RequestContext, LogHandler, isCancelled
 
@@ -21,11 +21,24 @@ type
   AuthenticateHandler* = proc(context: RequestContext, request: AuthenticateRequest,
     userData: pointer) {.nimcall, gcsafe.}
   CancelHandler* = proc(sessionId: string, userData: pointer) {.nimcall, gcsafe.}
+  SetConfigOptionHandler* = proc(context: RequestContext, request: SetConfigOptionRequest,
+    userData: pointer): seq[SessionConfigOption] {.nimcall, gcsafe.}
+  SetModeHandler* = proc(context: RequestContext, request: SetModeRequest,
+    userData: pointer) {.nimcall, gcsafe.}
+  ListSessionsHandler* = proc(context: RequestContext, request: ListSessionsRequest,
+    userData: pointer): ListSessionsResponse {.nimcall, gcsafe.}
+  CloseSessionHandler* = proc(context: RequestContext, request: CloseSessionRequest,
+    userData: pointer) {.nimcall, gcsafe.}
   AgentHandlers* = object
     onNewSession*, onLoadSession*: NewSessionHandler
     onPrompt*: PromptHandler
     onAuthenticate*: AuthenticateHandler
     onCancel*: CancelHandler
+    onResumeSession*: NewSessionHandler
+    onListSessions*: ListSessionsHandler
+    onCloseSession*: CloseSessionHandler
+    onSetConfigOption*: SetConfigOptionHandler
+    onSetMode*: SetModeHandler
     userData*: pointer
 
   AcpClient* = ptr object
@@ -58,9 +71,58 @@ proc requireConnection(client: AcpClient): Connection =
     result.release()
     raise newException(AcpProtocolError, "Client has not initialized")
 
+proc supportsBooleanConfig*(context: RequestContext): bool =
+  ## Inspect whether this client negotiated boolean configuration options.
+  context.connection.settings().field("clientCapabilities").field("session").field(
+    "configOptions").field("boolean").kind == JObject
+
+proc negotiatedOptions(context: RequestContext, options: JsonNode): JsonNode =
+  ## Omit boolean controls for peers that did not negotiate their wire contract.
+  discard parseConfigOptions(options)
+  result = newJArray()
+  for option in options:
+    if option.field("type").getStr() != "boolean" or context.supportsBooleanConfig():
+      result.add(option)
+
+proc getConfigOptions*(session: AcpSession): seq[SessionConfigOption] =
+  ## Return an owned snapshot of the latest peer-reported configuration catalog.
+  let connection = session.client.requireConnection()
+  defer: connection.release()
+  let options = connection.sessionSnapshot(session.id).field("configOptions")
+  if options.kind != JNull: result = parseConfigOptions(options)
+
+proc getModes*(session: AcpSession): Option[SessionModeState] =
+  ## Return an owned snapshot of the latest legacy mode state, when available.
+  let connection = session.client.requireConnection()
+  defer: connection.release()
+  let modes = connection.sessionSnapshot(session.id).field("modes")
+  if modes.kind != JNull: result = some(parseModes(modes))
+
+proc getSessionInfo*(session: AcpSession): Option[SessionInfo] =
+  ## Return current session metadata without activating stored sessions.
+  let connection = session.client.requireConnection()
+  defer: connection.release()
+  let info = connection.sessionSnapshot(session.id).field("info")
+  if info.field("cwd").kind == JString: result = some(parseSessionInfo(info))
+
+proc requireCapability(connection: Connection, capability: string) =
+  ## Guard optional lifecycle methods before sending a request to the peer.
+  if connection.settings().field("agentCapabilities").field("sessionCapabilities").field(capability).kind != JObject:
+    raise newException(AcpProtocolError, "Peer does not support session/" & capability)
+
+proc validateMode(modes: JsonNode, id: string) =
+  ## Reject unadvertised legacy mode identifiers.
+  if modes.kind != JNull:
+    for mode in parseModes(modes).availableModes:
+      if mode.id == id: return
+  raise rpcError(InvalidParams, "Unknown session mode: " & id)
+
 proc sendUpdate*(context: RequestContext, update: SessionUpdate) =
   ## Stream a structured session update from a request handler.
-  context.connection.notify("session/update", update.toJsonNode())
+  let params = update.toJsonNode().copy()
+  if params["update"].field("sessionUpdate").getStr() == "config_option_update":
+    params["update"]["configOptions"] = context.negotiatedOptions(params["update"].field("configOptions"))
+  context.connection.notify("session/update", params)
 
 proc requestPermission*(context: RequestContext, permission: PermissionRequest,
     timeoutMs = 0): PermissionOutcome =
@@ -85,7 +147,7 @@ proc clientRequest(context: RequestContext, methodName: string,
     raise rpcError(MethodNotFound, "Method not found: " & methodName)
   let permission = parsePermission(params)
   var outcome = PermissionOutcome(outcome: "cancelled")
-  if client.handlers.onPermission != nil:
+  if not context.isCancelled() and client.handlers.onPermission != nil:
     outcome = client.handlers.onPermission(context, permission, client.handlers.userData)
   if context.isCancelled(): outcome = PermissionOutcome(outcome: "cancelled")
   if outcome.outcome == "selected":
@@ -139,7 +201,8 @@ proc initialize*(client: AcpClient, timeoutMs = 0): InitializeResponse =
   if client.connection == nil: raise newException(AcpTransportError, "Client is not connected")
   if client.connection.isInitialized(): raise newException(AcpProtocolError, "Already initialized")
   let response = client.connection.request("initialize", %*{
-    "protocolVersion": ProtocolVersion, "clientCapabilities": {},
+    "protocolVersion": ProtocolVersion,
+    "clientCapabilities": {"session": {"configOptions": {"boolean": {}}}},
     "clientInfo": parseJson(localText(client.info))}, timeoutMs)
   if response.field("protocolVersion").kind != JInt or
       response["protocolVersion"].getInt() != ProtocolVersion:
@@ -191,6 +254,75 @@ proc loadSession*(client: AcpClient, sessionId: string, cwd: string,
     timeoutMs), sessionId)
   connection.registerSession(sessionId, allowExisting = true)
   AcpSession(client: client, id: sessionId, state: state)
+
+proc listSessions*(client: AcpClient, cwd = none(string), cursor = none(string),
+    timeoutMs = 0, meta: JsonNode = nil): ListSessionsResponse =
+  ## Fetch one capability-gated page of stored sessions without activating them.
+  if cwd.isSome and not cwd.get().isAbsolute():
+    raise newException(ValueError, "Session cwd filter must be absolute")
+  let connection = client.requireConnection()
+  defer: connection.release()
+  connection.requireCapability("list")
+  result = parseListSessionsResponse(connection.request("session/list",
+    ListSessionsRequest(cwd: cwd, cursor: cursor, meta: meta).toJsonNode(), timeoutMs))
+
+proc resumeSession*(client: AcpClient, sessionId: string, cwd: string,
+    mcpServers: seq[JsonNode] = @[], timeoutMs = 0, meta: JsonNode = nil): AcpSession =
+  ## Restore a session without replaying its conversation history.
+  if not cwd.isAbsolute(): raise newException(ValueError, "Session cwd must be absolute")
+  let connection = client.requireConnection()
+  defer: connection.release()
+  connection.requireCapability("resume")
+  let state = parseSessionResponse(connection.request("session/resume",
+    SessionRequest(cwd: cwd, sessionId: sessionId, mcpServers: mcpServers,
+      meta: meta).toJsonNode(true), timeoutMs), sessionId)
+  connection.registerSession(sessionId, allowExisting = true)
+  AcpSession(client: client, id: sessionId, state: state)
+
+proc closeSession*(session: AcpSession, timeoutMs = 0, meta: JsonNode = nil) =
+  ## Cancel and release one active session without deleting history or closing the client.
+  let connection = session.client.requireConnection()
+  defer: connection.release()
+  connection.requireCapability("close")
+  if connection.sessionIsClosed(session.id): return
+  connection.markSessionClosing(session.id)
+  var params = %*{"sessionId": session.id}
+  if meta != nil: params["_meta"] = meta
+  try:
+    discard connection.request("session/close", params, timeoutMs)
+  except AcpRpcError as error:
+    if error.code != SessionNotFound: raise
+
+proc setConfigOption*(session: AcpSession, configId: string, value: ConfigValue,
+    timeoutMs = 0, meta: JsonNode = nil): seq[SessionConfigOption] =
+  ## Change an advertised option and return the complete updated configuration catalog.
+  let connection = session.client.requireConnection()
+  defer: connection.release()
+  connection.requireOpenSession(session.id)
+  validateConfigValue(session.getConfigOptions(), configId, value)
+  result = parseConfigOptions(connection.request("session/set_config_option",
+    SetConfigOptionRequest(sessionId: session.id, configId: configId,
+      value: value, meta: meta).toJsonNode(), timeoutMs).field("configOptions"))
+
+proc setConfigOption*(session: AcpSession, configId: string, value: string,
+    timeoutMs = 0, meta: JsonNode = nil): seq[SessionConfigOption] =
+  ## Set a select option using its advertised string value identifier.
+  session.setConfigOption(configId, configValue(value), timeoutMs, meta)
+
+proc setConfigOption*(session: AcpSession, configId: string, value: bool,
+    timeoutMs = 0, meta: JsonNode = nil): seq[SessionConfigOption] =
+  ## Set a negotiated boolean option.
+  session.setConfigOption(configId, configValue(value), timeoutMs, meta)
+
+proc setMode*(session: AcpSession, modeId: string, timeoutMs = 0, meta: JsonNode = nil) =
+  ## Invoke the explicit legacy mode setter without guessing config-option identifiers.
+  let connection = session.client.requireConnection()
+  defer: connection.release()
+  connection.requireOpenSession(session.id)
+  validateMode(connection.sessionSnapshot(session.id).field("modes"), modeId)
+  var params = %*{"sessionId": session.id, "modeId": modeId}
+  if meta != nil: params["_meta"] = meta
+  discard connection.request("session/set_mode", params, timeoutMs)
 
 proc validateContent(prompt: seq[ContentBlock], capabilities: JsonNode) =
   ## Enforce advertised prompt content capabilities before dispatch.
@@ -263,9 +395,13 @@ proc agentRequest(context: RequestContext, methodName: string,
       raise rpcError(InvalidParams, "Missing protocolVersion")
     context.connection.markInitialized()
     context.connection.setSettings(params)
+    var capabilities = %*{"loadSession": agent.handlers.onLoadSession != nil, "sessionCapabilities": {}}
+    if agent.handlers.onListSessions != nil: capabilities["sessionCapabilities"]["list"] = newJObject()
+    if agent.handlers.onResumeSession != nil: capabilities["sessionCapabilities"]["resume"] = newJObject()
+    if agent.handlers.onCloseSession != nil: capabilities["sessionCapabilities"]["close"] = newJObject()
     return %*{"protocolVersion": ProtocolVersion,
       "agentInfo": parseJson(localText(agent.info)),
-      "agentCapabilities": {"loadSession": agent.handlers.onLoadSession != nil},
+      "agentCapabilities": capabilities,
       "authMethods": parseJson(localText(agent.authMethods))}
   if not context.connection.isInitialized(): raise rpcError(InvalidRequest, "Not initialized")
   case methodName
@@ -278,20 +414,58 @@ proc agentRequest(context: RequestContext, methodName: string,
       raise rpcError(InvalidParams, "Unsupported authentication method")
     agent.handlers.onAuthenticate(context, AuthenticateRequest(methodId: id), agent.handlers.userData)
     result = newJObject()
-  of "session/new", "session/load":
+  of "session/new", "session/load", "session/resume":
     let
-      load = methodName == "session/load"
+      load = methodName != "session/new"
       request = parseSessionRequest(params, load)
-      handler = if load: agent.handlers.onLoadSession else: agent.handlers.onNewSession
+      handler = case methodName
+        of "session/new": agent.handlers.onNewSession
+        of "session/load": agent.handlers.onLoadSession
+        else: agent.handlers.onResumeSession
     if not request.cwd.isAbsolute(): raise rpcError(InvalidParams, "Session cwd must be absolute")
     if handler == nil: raise rpcError(MethodNotFound, "Method not found: " & methodName)
     var response = handler(context, request, agent.handlers.userData)
+    if response.configOptions != nil and response.configOptions.kind != JNull:
+      response.configOptions = context.negotiatedOptions(response.configOptions)
     if load: response.sessionId = request.sessionId
     context.connection.registerSession(response.sessionId, allowExisting = load)
     result = response.toJsonNode(load)
+  of "session/list":
+    if agent.handlers.onListSessions == nil: raise rpcError(MethodNotFound, "Session listing is unsupported")
+    let request = parseListSessionsRequest(params)
+    if request.cwd.isSome and not request.cwd.get().isAbsolute():
+      raise rpcError(InvalidParams, "Session cwd filter must be absolute")
+    result = agent.handlers.onListSessions(context, request, agent.handlers.userData).toJsonNode()
+  of "session/set_config_option":
+    if agent.handlers.onSetConfigOption == nil: raise rpcError(MethodNotFound, "Configuration changes are unsupported")
+    let request = parseSetConfigOption(params)
+    context.connection.requireOpenSession(request.sessionId)
+    if request.value.kind == booleanConfigValue and not context.supportsBooleanConfig():
+      raise rpcError(InvalidParams, "Boolean configuration was not negotiated")
+    let options = context.connection.sessionSnapshot(request.sessionId).field("configOptions")
+    validateConfigValue(parseConfigOptions(options), request.configId, request.value)
+    let updated = agent.handlers.onSetConfigOption(context, request, agent.handlers.userData)
+    result = %*{"configOptions": context.negotiatedOptions(updated.toJsonNode())}
+  of "session/set_mode":
+    if agent.handlers.onSetMode == nil: raise rpcError(MethodNotFound, "Legacy mode changes are unsupported")
+    let request = parseSetMode(params)
+    context.connection.requireOpenSession(request.sessionId)
+    validateMode(context.connection.sessionSnapshot(request.sessionId).field("modes"), request.modeId)
+    agent.handlers.onSetMode(context, request, agent.handlers.userData)
+    result = newJObject()
+  of "session/close":
+    if agent.handlers.onCloseSession == nil: raise rpcError(MethodNotFound, "Session closing is unsupported")
+    let request = parseCloseSession(params)
+    if context.beginSessionClose(request.sessionId):
+      if agent.handlers.onCancel != nil: agent.handlers.onCancel(request.sessionId, agent.handlers.userData)
+      context.connection.cancelQueuedPrompts(request.sessionId)
+      context.waitSessionHandlers(request.sessionId)
+      agent.handlers.onCloseSession(context, request, agent.handlers.userData)
+    result = newJObject()
   of "session/prompt":
     let request = parsePrompt(params)
     validateContent(request.prompt, newJObject())
+    if context.isCancelled(): return PromptResponse(stopReason: cancelled).toJsonNode()
     context.connection.beginPrompt(request.sessionId)
     try:
       if context.isCancelled(): return PromptResponse(stopReason: cancelled).toJsonNode()

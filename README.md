@@ -3,12 +3,15 @@
 A threaded Nim library for [Agent Client Protocol](https://agentclientprotocol.com/)
 clients and agents. A sibling to [MCPort](https://github.com/monofuel/MCPort).
 
-## ACPort 1.0
+## ACPort 1.1
 
 Supports core **ACP v1 over Linux stdio**, with both client and agent/server APIs:
 
 - Version and capability negotiation, plus agent-managed authentication.
 - New sessions, multiple turns, concurrent sessions, and `session/load` with history replay.
+- Configuration catalogs with flat/grouped selects, negotiated booleans, and live updates.
+- Explicit legacy session modes, alongside `session/set_config_option`.
+- Paginated session listing, resume without history replay, and cooperative session closure.
 - Streamed messages, reasoning, tool reports, rich content, text diffs, and plans.
 - Permission requests with explicit approval, rejection, or cancellation.
 - Cooperative session cancellation and request deadlines.
@@ -16,17 +19,17 @@ Supports core **ACP v1 over Linux stdio**, with both client and agent/server API
 
 The implementation targets the stable v1 schema at
 [`c392d7e9d1de01337b749c0070929933e9f6f09f`](https://github.com/agentclientprotocol/agent-client-protocol/blob/c392d7e9d1de01337b749c0070929933e9f6f09f/schema/v1/schema.json).
-The package version `1.0.0` and the wire protocol version `1` are separate.
+The package version `1.1.0` and the wire protocol version `1` are separate.
 
 The library uses threads, locks, and condition variables, without asyncdispatch.
 Its only package dependency is [jsony](https://github.com/treeform/jsony), pinned
 in `nimby.lock`. HTTP libraries and MCPort are not required.
 
 HTTP/WebSocket transport, ACP v2, client filesystem and terminal execution,
-session-list/resume/close/delete methods, mode/config setters, and vendor-specific
-extensions are outside 1.0. Unknown update variants remain available as raw JSON.
+persisted session deletion, and vendor-specific extensions are outside 1.1.
+Unknown update variants remain available as raw JSON.
 Client filesystem, terminal, and other unsupported capabilities are not advertised.
-An agent advertises `loadSession` only when it has a load handler.
+An agent advertises lifecycle capabilities only when the corresponding handlers exist.
 
 ## Development
 
@@ -105,6 +108,47 @@ can be used by its adapter. `authenticate(methodId)` invokes an advertised
 agent-managed flow; ACPort does not launch interactive terminal authentication.
 No browser, login, retry, or reconnect is initiated automatically.
 
+## Session configuration and lifecycle
+
+`session.getConfigOptions()` returns the latest owned configuration snapshot.
+Discover identifiers and values from that catalog; categories such as `model` and
+`thought_level` are optional hints. Select choices may be flat (`options`) or
+grouped (`groups`). Use `setConfigOption(id, value)` with a string or boolean.
+Its response replaces the complete catalog: changing a model can also change
+the available reasoning levels. Unknown option types retain their raw payload
+for forwarding, but cannot be set through the typed API.
+
+Boolean options are negotiated through the client's
+`session.configOptions.boolean` capability. ACPort clients declare support, and
+ACPort agents omit boolean controls when a peer has not negotiated them.
+
+`getModes()` returns optional legacy mode state; `setMode(id)` invokes the legacy
+endpoint explicitly. ACPort does not guess a configuration identifier for modes
+or automatically retry using a different endpoint. `getSessionInfo()` returns
+known cwd, title and timestamp metadata. These getters read shared connection
+state and return independent snapshots. Copies of an `AcpSession` share the same
+live state. The existing `session.state` remains the initial response snapshot.
+
+Configuration, mode and metadata notifications update the cache in wire order
+before application callbacks run. Use `parseConfigOptionUpdate`,
+`parseCurrentModeUpdate`, or `parseSessionInfoUpdate` to decode them from an
+`unknownUpdate` callback. The 1.0 `UpdateKind` enum is unchanged. An omitted title
+or timestamp leaves it unchanged; explicit null clears it. Late responses after
+a request deadline still update live state.
+
+`client.listSessions(cwd = some(path), cursor = some(token))` returns exactly one
+page with an optional `nextCursor`; both arguments are optional. Listing does not
+activate stored sessions. `resumeSession(id, cwd)` restores a conversation without
+replaying its messages; status and metadata updates may still arrive. Use
+`loadSession` when history replay is needed. These optional methods check the
+peer's advertised capabilities before sending requests.
+
+`session.closeSession()` cancels ongoing work and releases that session's active
+resources while keeping the connection and saved history. Repeated closure is
+harmless. Copies of a closed session reject new prompts until an explicit load
+or resume reopens it. A close deadline leaves the session locally closing; retry
+close or explicitly load/resume to recover. ACPort never deletes persisted history.
+
 ## Agent/server
 
 Provide an `AgentHandlers` record to `newAcpAgent`, then call `runStdioAgent`.
@@ -114,6 +158,13 @@ for a complete in-memory echo agent.
 
 Session handlers return `SessionResponse` with an application-supplied unique ID.
 Load handlers restore application state and send replay updates before returning.
+Optional `onResumeSession`, `onListSessions`, `onCloseSession`,
+`onSetConfigOption`, and `onSetMode` handlers implement the additional endpoints.
+Resume handlers restore state without replay. Configuration handlers return the
+full authoritative catalog. Close signals cancellation, settles queued prompts,
+and waits for running handlers before invoking `onCloseSession` for application
+cleanup and acknowledging closure. Cleanup must retain whatever saved history
+the application needs for future load/resume.
 Prompt handlers receive typed content and return `PromptResponse` with a stop
 reason. A request context provides:
 
@@ -156,12 +207,16 @@ request handles may be collected after close. After `close`, the client pointer
 is freed and must not be used or closed again. Release an agent only after
 `runStdioAgent` returns.
 
-Request handlers run on a worker pool. Update and diagnostic callbacks run on one
+Prompt and permission handlers run on a worker pool. Session setup, lifecycle and
+configuration handlers run on a separate serial management thread, so a full
+prompt pool cannot starve them. Protect application state accessed from both.
+Update and diagnostic callbacks run on one
 ordered callback thread per connection. The reader and writer never invoke
 application callbacks. Callbacks must return promptly and cannot make blocking
 calls on the same connection; start work on another application thread instead.
-The optional agent `onCancel` hook follows the same callback-thread contract;
-cancellation flags are signaled by the reader before that hook runs.
+The optional agent `onCancel` hook runs on the callback thread for notifications
+and on the management thread during session closure. It must return promptly and
+be safe on either thread. Cancellation flags are set before the hook runs.
 
 Handlers are `nimcall, gcsafe` procedures, with an explicit application-owned
 `userData` pointer. They do not capture closures. Keep that state alive until
@@ -189,7 +244,7 @@ Scripted peers are unit tests, not evidence of live integration.
 Live tests use the pinned external `codex-acp` **2.6.0** adapter and an authenticated
 Codex CLI. The adapter speaks ACP and translates to Codex's separate App Server
 protocol; `codex exec --json` is not used as ACP.
-The 1.0 release was validated with `codex-cli 0.167.2`.
+The release is validated with `codex-cli 0.167.2`.
 
 ```sh
 make integration-setup
@@ -210,7 +265,10 @@ Test-local approval/sandbox settings do not edit global Codex configuration.
 The suite exercises both direct ACPort-to-Codex connections and a real Nim relay
 using ACPort's agent and client APIs. It verifies streaming, multiple turns,
 persisted context after restart, approved and rejected file writes, cancellation,
-and another successful turn afterward. Work occurs in temporary directories.
+and another successful turn afterward. It also exercises advertised model and
+reasoning settings, legacy modes, filtered listing, close/resume without replay,
+and closing an active turn while retaining a usable connection.
+Work occurs in temporary directories.
 Missing tools, credentials, or required interactions fail rather than skip.
 Diagnostic event and stderr transcripts stay under ignored `build/`.
 

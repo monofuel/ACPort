@@ -1,5 +1,5 @@
 import
-  std/[json, locks, monotimes, os, osproc, strtabs, strutils, tempfiles, times, unittest],
+  std/[json, locks, monotimes, options, os, osproc, strtabs, strutils, tempfiles, times, unittest],
   acport,
   acport/connection
 
@@ -7,7 +7,7 @@ type
   Capture = object
     lock: Lock
     text: SharedText
-    tools, updates, permissions: int
+    tools, updates, permissions, history: int
     reject: bool
 
 const
@@ -19,6 +19,8 @@ proc onUpdate(update: SessionUpdate, userData: pointer) {.gcsafe.} =
   let state = cast[ptr Capture](userData)
   withLock state.lock:
     inc state.updates
+    if update.kind in {userMessageChunk, agentMessageChunk, agentThoughtChunk, toolCall, toolCallUpdate}:
+      inc state.history
     if update.kind == toolCall: inc state.tools
     if update.kind == agentMessageChunk and update.content.kind == textContent:
       let text = localText(state.text) & update.content.text
@@ -75,6 +77,7 @@ proc resetCapture(state: ptr Capture) =
     state.updates = 0
     state.tools = 0
     state.permissions = 0
+    state.history = 0
 
 proc capturedText(state: ptr Capture): string =
   ## Copy shared text into the calling thread's heap.
@@ -97,6 +100,18 @@ proc runLive(relay: bool) =
     defer: client.close()
     let session = client.newSession(directory, timeoutMs = 60_000)
     sessionId = session.id
+    var foundModel, foundReasoning: bool
+    for option in session.getConfigOptions():
+      if option.category.get("") == "model":
+        discard session.setConfigOption(option.id, option.currentValue, 60_000)
+        foundModel = true
+      if option.category.get("") == "thought_level":
+        discard session.setConfigOption(option.id, option.currentValue, 60_000)
+        foundReasoning = true
+    doAssert foundModel and foundReasoning, "Codex must advertise model and reasoning settings"
+    let modes = session.getModes().get()
+    session.setMode(modes.currentModeId, 60_000)
+    doAssert session.getModes().get().currentModeId == modes.currentModeId
     doAssert session.prompt("Remember this word for our next turn: cobalt. Reply only READY. Do not use tools.",
       TestDeadlineMs).stopReason == endTurn
     doAssert state.capturedText().contains("READY")
@@ -105,6 +120,21 @@ proc runLive(relay: bool) =
     doAssert session.prompt("What word did I ask you to remember? Reply with only that word. Do not use tools.",
       TestDeadlineMs).stopReason == endTurn
     doAssert state.capturedText().toLowerAscii().contains("cobalt")
+    session.closeSession(60_000)
+    state.resetCapture()
+    discard client.resumeSession(sessionId, directory, timeoutMs = 60_000)
+    doAssert state.history == 0, "Resume must not replay history"
+    doAssert session.prompt("What word did I ask you to remember? Reply with only that word. Do not use tools.",
+      TestDeadlineMs).stopReason == endTurn
+    doAssert state.capturedText().toLowerAscii().contains("cobalt")
+    var page = client.listSessions(cwd = some(directory), timeoutMs = 60_000)
+    var found = false
+    while true:
+      for info in page.sessions:
+        if info.sessionId == sessionId: found = true
+      if found or page.nextCursor.isNone: break
+      page = client.listSessions(cwd = some(directory), cursor = page.nextCursor, timeoutMs = 60_000)
+    doAssert found, "Created session must appear in the filtered session list"
     state.resetCapture()
     let path = directory / "approved.txt"
     doAssert session.prompt("Use a shell command to write exactly ACPORT_APPROVED into " & path &
@@ -139,6 +169,20 @@ proc runLive(relay: bool) =
     state.resetCapture()
     doAssert session.prompt("Reply only ALIVE. Do not use tools.", TestDeadlineMs).stopReason == endTurn
     doAssert state.capturedText().contains("ALIVE")
+    state.resetCapture()
+    var closing = session.startPrompt(@[textBlock("Run the shell command sleep 30 and wait. Do not shorten it.")])
+    let closeStarted = getMonoTime()
+    var closeActive = false
+    while (getMonoTime() - closeStarted).inMilliseconds < 120_000:
+      withLock state.lock: closeActive = state.tools > 0
+      if closeActive: break
+      sleep(25)
+    doAssert closeActive
+    session.closeSession(60_000)
+    doAssert closing.waitForPrompt(60_000).stopReason == cancelled
+    let other = client.newSession(directory, timeoutMs = 60_000)
+    doAssert other.prompt("Reply only CONNECTED. Do not use tools.", TestDeadlineMs).stopReason == endTurn
+    other.closeSession(60_000)
   block:
     state.resetCapture()
     let client = connectCodex(state, relay)

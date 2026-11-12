@@ -68,6 +68,36 @@ proc runPrompt(context: RequestContext, request: PromptRequest,
     withLock state.lock: entry.active = false
   AcpSession(client: state.backend, id: request.sessionId).prompt(request.prompt, meta = request.meta)
 
+proc resumeSession(context: RequestContext, request: SessionRequest,
+    userData: pointer): SessionResponse {.gcsafe.} =
+  ## Restore the backend session without replaying conversation history.
+  let state = cast[ptr RelayState](userData)
+  withLock state.lock: state.upstream = context.connection
+  state.backend.resumeSession(request.sessionId, request.cwd, request.mcpServers, meta = request.meta).state
+
+proc listSessions(context: RequestContext, request: ListSessionsRequest,
+    userData: pointer): ListSessionsResponse {.gcsafe.} =
+  ## Forward exactly one page with its opaque cursor and metadata.
+  cast[ptr RelayState](userData).backend.listSessions(request.cwd, request.cursor, meta = request.meta)
+
+proc closeSession(context: RequestContext, request: CloseSessionRequest,
+    userData: pointer) {.gcsafe.} =
+  ## Release backend resources after the outer prompt has settled.
+  AcpSession(client: cast[ptr RelayState](userData).backend,
+    id: request.sessionId).closeSession(meta = request.meta)
+
+proc setConfig(context: RequestContext, request: SetConfigOptionRequest,
+    userData: pointer): seq[SessionConfigOption] {.gcsafe.} =
+  ## Forward settings and return the backend's complete authoritative catalog.
+  AcpSession(client: cast[ptr RelayState](userData).backend,
+    id: request.sessionId).setConfigOption(request.configId, request.value, meta = request.meta)
+
+proc setMode(context: RequestContext, request: SetModeRequest,
+    userData: pointer) {.gcsafe.} =
+  ## Support the legacy mode endpoint explicitly.
+  AcpSession(client: cast[ptr RelayState](userData).backend,
+    id: request.sessionId).setMode(request.modeId, meta = request.meta)
+
 proc cancelSession(sessionId: string, userData: pointer) {.gcsafe.} =
   ## Forward cancellation without blocking the outer I/O reader.
   let state = cast[ptr RelayState](userData)
@@ -94,7 +124,9 @@ proc main() =
   discard state.backend.initialize(60_000)
   let agent = newAcpAgent("acport-codex-relay", AcportVersion,
     AgentHandlers(onNewSession: createSession, onLoadSession: loadSession,
-      onPrompt: runPrompt, onCancel: cancelSession, userData: state))
+      onPrompt: runPrompt, onCancel: cancelSession, onResumeSession: resumeSession,
+      onListSessions: listSessions, onCloseSession: closeSession,
+      onSetConfigOption: setConfig, onSetMode: setMode, userData: state))
   defer: agent.close()
   agent.runStdioAgent()
 

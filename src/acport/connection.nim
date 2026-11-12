@@ -1,6 +1,6 @@
 import
   std/[json, locks, monotimes, os, posix, times, unicode],
-  ./protocol
+  ./[protocol, session_protocol]
 
 type
   SharedText* = ptr object
@@ -26,6 +26,8 @@ type
   TaskObj = object
     id, methodName, params, sessionId: SharedText
     cancelled: bool
+    running: bool
+    modeRevision: uint64
     next, activeNext: Task
 
   EventObj = object
@@ -41,12 +43,18 @@ type
     connection: Connection
     id: int
     sessionId: SharedText
+    methodName, params: SharedText
+    modeRevision: uint64
+    abandoned: bool
     response: SharedText
     barrier: uint64
     next: PendingRequest
 
   Session = ptr object
     id: SharedText
+    snapshot: SharedText
+    known, closed, closing: bool
+    modeRevision: uint64
     busy: bool
     requestId: int
     next: Session
@@ -67,6 +75,7 @@ type
     pending: PendingRequest
     outgoingHead, outgoingTail: Outgoing
     taskHead, taskTail, active: Task
+    managementHead, managementTail: Task
     eventHead, eventTail: Event
     queued, delivered: uint64
     callbackThreadId: int
@@ -74,7 +83,7 @@ type
     notificationHandler: NotificationHandler
     logHandler: LogHandler
     userData*: pointer
-    reader, writer, notifier: Thread[Connection]
+    reader, writer, notifier, manager: Thread[Connection]
     workers: ptr UncheckedArray[Thread[Connection]]
     workerCount: int
 
@@ -99,6 +108,14 @@ proc freeText*(text: SharedText) =
   ## Release an owned shared buffer.
   if text != nil: deallocShared(text)
 
+proc destroyTask(task: Task) =
+  ## Release an incoming request after its handler and response have settled.
+  freeText(task.id)
+  freeText(task.methodName)
+  freeText(task.params)
+  freeText(task.sessionId)
+  deallocShared(task)
+
 proc retain*(connection: Connection) =
   ## Keep connection state alive for an entire public API operation.
   withLock connection.lock: inc connection.references
@@ -114,6 +131,7 @@ proc release*(connection: Connection) =
     while session != nil:
       let next = session.next
       freeText(session.id)
+      freeText(session.snapshot)
       deallocShared(session)
       session = next
     freeText(connection.failure)
@@ -142,6 +160,157 @@ proc isStopped(connection: Connection): bool =
   withLock connection.lock:
     result = connection.closing or connection.failed
 
+proc sessionLocked(connection: Connection, id: string, create = false): Session =
+  ## Locate session state while the caller holds the connection lock.
+  result = connection.sessions
+  while result != nil:
+    if localText(result.id) == id: return
+    result = result.next
+  if create:
+    result = cast[Session](allocShared0(sizeof(result[])))
+    result.id = sharedText(id)
+    result.next = connection.sessions
+    connection.sessions = result
+
+proc snapshotLocked(session: Session): JsonNode =
+  ## Copy a session snapshot into the locked caller's thread-local heap.
+  if session != nil and session.snapshot != nil: parseJson(localText(session.snapshot))
+  else: newJObject()
+
+proc saveSnapshotLocked(session: Session, snapshot: JsonNode) =
+  ## Replace a session snapshot without sharing managed JSON references.
+  let text = sharedText($snapshot)
+  freeText(session.snapshot)
+  session.snapshot = text
+
+proc applyUpdateLocked(connection: Connection, params: JsonNode) =
+  ## Apply state-bearing notifications in the same order as the wire stream.
+  let
+    id = params.requiredString("sessionId")
+    update = params.field("update")
+    kind = update.field("sessionUpdate").getStr()
+  if kind notin ["config_option_update", "current_mode_update", "session_info_update"]: return
+  let
+    session = connection.sessionLocked(id, true)
+    snapshot = session.snapshotLocked()
+  case kind
+  of "config_option_update":
+    discard parseConfigOptions(update.field("configOptions"))
+    snapshot["configOptions"] = update["configOptions"]
+  of "current_mode_update":
+    let mode = update.requiredString("currentModeId")
+    if snapshot.field("modes").kind != JObject:
+      snapshot["modes"] = %*{"availableModes": []}
+    snapshot["modes"]["currentModeId"] = %mode
+    inc session.modeRevision
+  of "session_info_update":
+    if snapshot.field("info").kind != JObject: snapshot["info"] = %*{"sessionId": id}
+    for key in ["title", "updatedAt", "_meta"]:
+      if update.hasKey(key): snapshot["info"][key] = update[key]
+  else: discard
+  session.saveSnapshotLocked(snapshot)
+
+proc applyResponseLocked(connection: Connection, methodName: string, params,
+    response: JsonNode, modeRevision: uint64) =
+  ## Apply received response metadata before waking callers or delivering callbacks.
+  if methodName == "session/list":
+    discard parseListSessionsResponse(response)
+    for info in response["sessions"]:
+      let
+        session = connection.sessionLocked(info.requiredString("sessionId"), true)
+        snapshot = session.snapshotLocked()
+      snapshot["info"] = info
+      session.saveSnapshotLocked(snapshot)
+    return
+  if methodName notin ["session/new", "session/load", "session/resume",
+      "session/set_config_option", "session/set_mode", "session/close"]: return
+  let
+    id = if methodName == "session/new": response.requiredString("sessionId")
+      else: params.requiredString("sessionId")
+    session = connection.sessionLocked(id, true)
+    snapshot = session.snapshotLocked()
+  if methodName in ["session/new", "session/load", "session/resume"]:
+    for key in ["configOptions", "modes"]:
+      if response.hasKey(key):
+        if response[key].kind != JNull:
+          if key == "modes": discard parseModes(response[key])
+          else: discard parseConfigOptions(response[key])
+        snapshot[key] = response[key]
+        if key == "modes": inc session.modeRevision
+    if snapshot.field("info").kind != JObject: snapshot["info"] = newJObject()
+    snapshot["info"]["sessionId"] = %id
+    snapshot["info"]["cwd"] = params.field("cwd")
+    session.closed = false
+    session.closing = false
+  elif methodName == "session/set_config_option":
+    discard parseConfigOptions(response.field("configOptions"))
+    snapshot["configOptions"] = response["configOptions"]
+  elif methodName == "session/set_mode":
+    if session.modeRevision == modeRevision and snapshot.field("modes").kind == JObject:
+      snapshot["modes"]["currentModeId"] = params.field("modeId")
+  else:
+    session.closed = true
+    session.closing = false
+    session.busy = false
+  session.saveSnapshotLocked(snapshot)
+
+proc sessionSnapshot*(connection: Connection, id: string): JsonNode =
+  ## Return an independently owned current-state snapshot, including closed history.
+  withLock connection.lock:
+    let session = connection.sessionLocked(id)
+    if session == nil: raise rpcError(SessionNotFound, "Unknown session: " & id)
+    result = session.snapshotLocked()
+
+proc requireOpenSession*(connection: Connection, id: string) =
+  ## Reject operations on unknown, closed, or closing sessions.
+  withLock connection.lock:
+    let session = connection.sessionLocked(id)
+    if session == nil or not session.known or session.closed or session.closing:
+      raise rpcError(SessionNotFound, "Session is not active: " & id)
+
+proc sessionIsClosed*(connection: Connection, id: string): bool =
+  ## Test whether a previously closed session has already completed cleanup.
+  withLock connection.lock:
+    let session = connection.sessionLocked(id)
+    result = session != nil and session.closed
+
+proc markSessionClosing*(connection: Connection, id: string) =
+  ## Prevent copied session handles from starting new work during closure.
+  withLock connection.lock:
+    let session = connection.sessionLocked(id, true)
+    if not session.closed: session.closing = true
+
+proc beginSessionClose*(context: RequestContext, id: string): bool =
+  ## Cancel session work before application cleanup, without cancelling the close itself.
+  let connection = context.connection
+  withLock connection.lock:
+    let session = connection.sessionLocked(id)
+    if session == nil or not session.known or session.closed: return false
+    session.closing = true
+    var task = connection.active
+    while task != nil:
+      if task != context.task and localText(task.sessionId) == id and
+          localText(task.methodName) != "session/close": task.cancelled = true
+      task = task.activeNext
+    broadcast(connection.changed)
+    result = true
+
+proc waitSessionHandlers*(context: RequestContext, id: string) =
+  ## Wait until running session handlers have returned and their responses are queued.
+  let connection = context.connection
+  acquire(connection.lock)
+  while true:
+    var
+      task = connection.active
+      running = false
+    while task != nil:
+      if task != context.task and task.running and localText(task.sessionId) == id:
+        running = true
+      task = task.activeNext
+    if not running: break
+    wait(connection.changed, connection.lock)
+  release(connection.lock)
+
 proc enqueue(connection: Connection, node: JsonNode) =
   ## Queue a complete JSON-RPC message for the sole pipe writer.
   let outgoing = cast[Outgoing](allocShared0(sizeof(OutgoingObj)))
@@ -150,19 +319,62 @@ proc enqueue(connection: Connection, node: JsonNode) =
     deallocShared(outgoing)
     raise newException(AcpProtocolError, "Outgoing JSON must be UTF-8")
   outgoing.text = sharedText(text)
-  withLock connection.lock:
-    if connection.closing or connection.failed:
-      freeText(outgoing.text)
-      deallocShared(outgoing)
-      raise newException(AcpTransportError, "Connection is closed")
-    if connection.outgoingTail == nil: connection.outgoingHead = outgoing
-    else: connection.outgoingTail.next = outgoing
-    connection.outgoingTail = outgoing
-    broadcast(connection.changed)
+  try:
+    withLock connection.lock:
+      if connection.closing or connection.failed:
+        raise newException(AcpTransportError, "Connection is closed")
+      if node.field("method").getStr() == "session/update":
+        connection.applyUpdateLocked(node.field("params"))
+      elif node.hasKey("result"):
+        var task = connection.active
+        while task != nil:
+          if localText(task.id) == $node.field("id"):
+            connection.applyResponseLocked(localText(task.methodName), parseJson(localText(task.params)),
+              node["result"], task.modeRevision)
+            break
+          task = task.activeNext
+      if connection.outgoingTail == nil: connection.outgoingHead = outgoing
+      else: connection.outgoingTail.next = outgoing
+      connection.outgoingTail = outgoing
+      broadcast(connection.changed)
+  except CatchableError:
+    freeText(outgoing.text)
+    deallocShared(outgoing)
+    raise
 
 proc notify*(connection: Connection, methodName: string, params: JsonNode) =
   ## Send a notification with no request identifier.
   connection.enqueue(%*{"jsonrpc": "2.0", "method": methodName, "params": params})
+
+proc cancelQueuedPrompts*(connection: Connection, id: string) =
+  ## Settle queued turns during close even when every prompt worker is occupied.
+  var removed: Task
+  withLock connection.lock:
+    var link = addr connection.taskHead
+    while link[] != nil:
+      let task = link[]
+      if localText(task.sessionId) == id and localText(task.methodName) == "session/prompt":
+        link[] = task.next
+        var activeLink = addr connection.active
+        while activeLink[] != task: activeLink = addr activeLink[].activeNext
+        activeLink[] = task.activeNext
+        task.next = removed
+        removed = task
+      else:
+        link = addr task.next
+    connection.taskTail = connection.taskHead
+    while connection.taskTail != nil and connection.taskTail.next != nil:
+      connection.taskTail = connection.taskTail.next
+  while removed != nil:
+    let task = removed
+    removed = task.next
+    try:
+      connection.enqueue(%*{"jsonrpc": "2.0", "id": parseJson(localText(task.id)),
+        "result": {"stopReason": "cancelled"}})
+    except AcpTransportError:
+      discard # Continue freeing detached tasks after disconnect.
+    finally:
+      destroyTask(task)
 
 proc isCancelled*(context: RequestContext): bool =
   ## Inspect cooperative cancellation without blocking protocol I/O.
@@ -194,9 +406,13 @@ proc startRequest*(connection: Connection, methodName: string,
   result = cast[PendingRequest](allocShared0(sizeof(PendingObj)))
   result.connection = connection
   result.sessionId = sharedText(params.field("sessionId").getStr())
+  result.methodName = sharedText(methodName)
+  result.params = sharedText($params)
   withLock connection.lock:
     if connection.closing or connection.failed:
       freeText(result.sessionId)
+      freeText(result.methodName)
+      freeText(result.params)
       deallocShared(result)
       raise newException(AcpTransportError, "Connection is closed")
     inc connection.nextId
@@ -204,6 +420,8 @@ proc startRequest*(connection: Connection, methodName: string,
     result.next = connection.pending
     connection.pending = result
     inc connection.references
+    let session = connection.sessionLocked(params.field("sessionId").getStr())
+    if session != nil: result.modeRevision = session.modeRevision
     if methodName == "session/prompt":
       var session = connection.sessions
       while session != nil:
@@ -213,7 +431,7 @@ proc startRequest*(connection: Connection, methodName: string,
     connection.enqueue(%*{"jsonrpc": "2.0", "id": result.id,
       "method": methodName, "params": params})
   except CatchableError as error:
-    connection.fail(error.msg, error of AcpProtocolError)
+    connection.fail(error.msg, error of AcpProtocolError or error of AcpRpcError)
 
 proc timedWait(connection: Connection, milliseconds: int) =
   ## Sleep on the state condition, with an optional bounded wakeup.
@@ -229,12 +447,22 @@ proc timedWait(connection: Connection, milliseconds: int) =
       cast[ptr Pthread_mutex](addr connection.lock), addr deadline)
     if code != 0 and code != ETIMEDOUT: raiseOSError(OSErrorCode(code))
 
+proc destroyPending(pending: PendingRequest) =
+  ## Release an owned pending record after it is removed from the routing list.
+  freeText(pending.sessionId)
+  freeText(pending.methodName)
+  freeText(pending.params)
+  freeText(pending.response)
+  deallocShared(pending)
+
 proc waitResponse*(pending: PendingRequest, timeoutMs = 0,
     context = RequestContext()): JsonNode =
   ## Consume a pending request once, after all preceding update callbacks finish.
   let
     connection = pending.connection
     started = getMonoTime()
+  connection.retain()
+  defer: connection.release()
   var
     response, failure: string
     expired, interrupted, protocolFailure: bool
@@ -265,21 +493,29 @@ proc waitResponse*(pending: PendingRequest, timeoutMs = 0,
       expired = true
       break
     connection.timedWait(if timeoutMs > 0: min(timeoutMs, IoPollMs) else: 0)
-  var link = addr connection.pending
-  while link[] != pending: link = addr link[].next
-  link[] = pending.next
+  let
+    abandon = (expired or interrupted) and pending.response == nil and
+      not connection.closing and not connection.failed
+    requestId = pending.id
+    sessionId = localText(pending.sessionId)
+    promptRequest = localText(pending.methodName) == "session/prompt"
+  if abandon:
+    pending.abandoned = true
+  else:
+    var link = addr connection.pending
+    while link[] != pending: link = addr link[].next
+    link[] = pending.next
   release(connection.lock)
   if expired or interrupted:
     try:
-      connection.notify("$/cancel_request", %*{"requestId": pending.id})
-      if expired and localText(pending.sessionId).len > 0:
-        connection.cancel(localText(pending.sessionId))
+      connection.notify("$/cancel_request", %*{"requestId": requestId})
+      if expired and promptRequest and sessionId.len > 0:
+        connection.cancel(sessionId)
     except AcpTransportError:
       discard # The connection may have closed after the waiter woke up.
-  freeText(pending.sessionId)
-  freeText(pending.response)
-  deallocShared(pending)
-  connection.release()
+  if not abandon:
+    destroyPending(pending)
+    connection.release()
   if expired: raise newException(AcpTimeoutError, "ACP request deadline expired")
   if interrupted: raise newException(AcpCancelledError, "ACP request cancelled")
   if failure.len > 0:
@@ -323,16 +559,10 @@ proc registerSession*(connection: Connection, sessionId: string, allowExisting =
   ## Register a session after successful creation or loading.
   if sessionId.len == 0: raise rpcError(InvalidParams, "Empty session identifier")
   withLock connection.lock:
-    var session = connection.sessions
-    while session != nil:
-      if localText(session.id) == sessionId:
-        if allowExisting: return
-        raise newException(AcpProtocolError, "Duplicate session identifier: " & sessionId)
-      session = session.next
-    session = cast[Session](allocShared0(sizeof(session[])))
-    session.id = sharedText(sessionId)
-    session.next = connection.sessions
-    connection.sessions = session
+    let session = connection.sessionLocked(sessionId, true)
+    if session.known and not allowExisting:
+      raise newException(AcpProtocolError, "Duplicate session identifier: " & sessionId)
+    session.known = true
 
 proc beginPrompt*(connection: Connection, sessionId: string) =
   ## Claim the sole active prompt slot for a known session.
@@ -340,6 +570,8 @@ proc beginPrompt*(connection: Connection, sessionId: string) =
     var session = connection.sessions
     while session != nil:
       if localText(session.id) == sessionId:
+        if not session.known or session.closed or session.closing:
+          raise rpcError(SessionNotFound, "Session is not active: " & sessionId)
         if session.busy: raise rpcError(InvalidRequest, "Session already has an active prompt")
         session.busy = true
         return
@@ -362,7 +594,7 @@ proc isPromptActive*(connection: Connection, sessionId: string): bool =
   withLock connection.lock:
     var session = connection.sessions
     while session != nil:
-      if localText(session.id) == sessionId: return session.busy
+      if localText(session.id) == sessionId: return session.busy and not session.closed
       session = session.next
 
 proc sendError(connection: Connection, id: JsonNode, code: int, message: string,
@@ -415,6 +647,8 @@ proc handleLine(connection: Connection, line: string) =
       methodName = node["method"].getStr()
       params = node.field("params")
     if not node.hasKey("id"):
+      if methodName == "session/update":
+        withLock connection.lock: connection.applyUpdateLocked(params)
       if methodName == "session/cancel":
         connection.cancelSession(params.field("sessionId").getStr())
       elif methodName == "$/cancel_request":
@@ -442,9 +676,17 @@ proc handleLine(connection: Connection, line: string) =
           return
         task.activeNext = connection.active
         connection.active = task
-        if connection.taskTail == nil: connection.taskHead = task
-        else: connection.taskTail.next = task
-        connection.taskTail = task
+        let session = connection.sessionLocked(params.field("sessionId").getStr())
+        if session != nil: task.modeRevision = session.modeRevision
+        if methodName in ["session/new", "session/load", "session/resume", "session/list",
+            "session/close", "session/set_mode", "session/set_config_option"]:
+          if connection.managementTail == nil: connection.managementHead = task
+          else: connection.managementTail.next = task
+          connection.managementTail = task
+        else:
+          if connection.taskTail == nil: connection.taskHead = task
+          else: connection.taskTail.next = task
+          connection.taskTail = task
         broadcast(connection.changed)
   elif node.hasKey("id"):
     if node.hasKey("result") == node.hasKey("error"):
@@ -454,6 +696,7 @@ proc handleLine(connection: Connection, line: string) =
         node["error"].field("message").kind != JString):
       connection.fail("Malformed JSON-RPC error response", true)
       return
+    var abandoned: PendingRequest
     withLock connection.lock:
       var session = connection.sessions
       while session != nil:
@@ -465,6 +708,15 @@ proc handleLine(connection: Connection, line: string) =
       var pending = connection.pending
       while pending != nil:
         if node["id"].kind == JInt and pending.id == node["id"].getInt():
+          let methodName = localText(pending.methodName)
+          if node.hasKey("result"):
+            connection.applyResponseLocked(methodName, parseJson(localText(pending.params)),
+              node["result"], pending.modeRevision)
+          elif methodName == "session/close" and node["error"].field("code").getInt() == SessionNotFound:
+            let session = connection.sessionLocked(localText(pending.sessionId), true)
+            session.closed = true
+            session.closing = false
+            session.busy = false
           if pending.response != nil:
             connection.failed = true
             connection.protocolFailure = true
@@ -472,9 +724,17 @@ proc handleLine(connection: Connection, line: string) =
           else:
             pending.response = sharedText(line)
             pending.barrier = connection.queued
+          if pending.abandoned:
+            var link = addr connection.pending
+            while link[] != pending: link = addr link[].next
+            link[] = pending.next
+            abandoned = pending
           broadcast(connection.changed)
           break
         pending = pending.next
+    if abandoned != nil:
+      destroyPending(abandoned)
+      connection.release()
   else:
     connection.sendError(newJNull(), InvalidRequest, "Invalid JSON-RPC message")
 
@@ -560,7 +820,7 @@ proc readerThread(connection: Connection) {.thread.} =
               start = position + 1
           if start > 0: pending = pending[start .. ^1]
   except CatchableError as error:
-    connection.fail(error.msg, error of AcpProtocolError)
+    connection.fail(error.msg, error of AcpProtocolError or error of AcpRpcError)
 
 proc notifierThread(connection: Connection) {.thread.} =
   ## Deliver ordered callbacks without running application code on the I/O thread.
@@ -590,16 +850,20 @@ proc notifierThread(connection: Connection) {.thread.} =
     freeText(event.params)
     deallocShared(event)
 
-proc workerThread(connection: Connection) {.thread.} =
+proc workerLoop(connection: Connection, management: bool) {.gcsafe.} =
   ## Execute blocking request handlers independently of routing and callbacks.
   while true:
     acquire(connection.lock)
-    while connection.taskHead == nil and not connection.closing and not connection.failed:
+    let
+      head = if management: addr connection.managementHead else: addr connection.taskHead
+      tail = if management: addr connection.managementTail else: addr connection.taskTail
+    while head[] == nil and not connection.closing and not connection.failed:
       wait(connection.changed, connection.lock)
-    let task = connection.taskHead
+    let task = head[]
     if task != nil:
-      connection.taskHead = task.next
-      if connection.taskHead == nil: connection.taskTail = nil
+      head[] = task.next
+      if head[] == nil: tail[] = nil
+      task.running = true
     release(connection.lock)
     if task == nil: break
     let context = RequestContext(connection: connection, task: task)
@@ -619,11 +883,16 @@ proc workerThread(connection: Connection) {.thread.} =
       var link = addr connection.active
       while link[] != task: link = addr link[].activeNext
       link[] = task.activeNext
-    freeText(task.id)
-    freeText(task.methodName)
-    freeText(task.params)
-    freeText(task.sessionId)
-    deallocShared(task)
+      broadcast(connection.changed)
+    destroyTask(task)
+
+proc workerThread(connection: Connection) {.thread.} =
+  ## Service ordinary requests and long-running prompts.
+  workerLoop(connection, false)
+
+proc managementThread(connection: Connection) {.thread.} =
+  ## Keep lifecycle and configuration requests independent of occupied prompt workers.
+  workerLoop(connection, true)
 
 proc newConnection*(inputFd, outputFd: cint, requestHandler: RequestHandler,
     notificationHandler: NotificationHandler, userData: pointer = nil,
@@ -643,7 +912,7 @@ proc newConnection*(inputFd, outputFd: cint, requestHandler: RequestHandler,
   result.logHandler = logHandler
   result.userData = userData
   var
-    notifierStarted, writerStarted: bool
+    notifierStarted, writerStarted, managerStarted: bool
     flagsChanged = 0
   try:
     for index, fd in [inputFd, outputFd, errorFd]:
@@ -659,6 +928,8 @@ proc newConnection*(inputFd, outputFd: cint, requestHandler: RequestHandler,
     for i in 0 ..< workerThreads:
       createThread(result.workers[i], workerThread, result)
       inc result.workerCount
+    createThread(result.manager, managementThread, result)
+    managerStarted = true
     createThread(result.notifier, notifierThread, result)
     notifierStarted = true
     createThread(result.writer, writerThread, result)
@@ -670,6 +941,7 @@ proc newConnection*(inputFd, outputFd: cint, requestHandler: RequestHandler,
       broadcast(result.changed)
     if writerStarted: joinThread(result.writer)
     if notifierStarted: joinThread(result.notifier)
+    if managerStarted: joinThread(result.manager)
     for i in 0 ..< result.workerCount: joinThread(result.workers[i])
     for index, fd in [inputFd, outputFd, errorFd]:
       if index < flagsChanged and fd >= 0: discard fcntl(fd, F_SETFL, result.originalFlags[index])
@@ -695,7 +967,18 @@ proc close*(connection: Connection) =
   joinThread(connection.reader)
   joinThread(connection.writer)
   joinThread(connection.notifier)
+  joinThread(connection.manager)
   for i in 0 ..< connection.workerCount: joinThread(connection.workers[i])
+  withLock connection.lock:
+    var link = addr connection.pending
+    while link[] != nil:
+      let pending = link[]
+      if pending.abandoned:
+        link[] = pending.next
+        destroyPending(pending)
+        dec connection.references
+      else:
+        link = addr pending.next
   for index, fd in [connection.inputFd, connection.outputFd, connection.errorFd]:
     if fd >= 0: discard fcntl(fd, F_SETFL, connection.originalFlags[index])
   connection.release()

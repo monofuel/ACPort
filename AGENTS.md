@@ -17,6 +17,6 @@ Nim library for Agent Client Protocol clients and agents, alongside MCPort.
 - Advertise only protocol capabilities the implementation actually handles.
 - Keep stdio stdout exclusively for protocol messages; send diagnostics to stderr.
 
-Linux stdio and core ACP v1 are the 1.0 surface. Keep application policy,
+Linux stdio and ACP v1 are the 1.x surface. Keep application policy,
 providers, persistence, and orchestration outside the library. Thread boundaries
 must transfer owned shared buffers, never managed strings or JSON references.
