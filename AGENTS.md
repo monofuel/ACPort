@@ -9,7 +9,9 @@ Nim library for Agent Client Protocol clients and agents, alongside MCPort.
 - Keep project compiler settings in `config.nims` and commit `nimby.lock`.
 - Run `make setup` to sync dependencies and `make check` to check the module.
 - Run `make test-arc` and `make test-orc` for deterministic tests in both memory managers.
-- Run `make integration-test` for real Codex tests. Missing prerequisites must fail, not skip.
+- Run `make integration-test` for real Codex, Grok, and Claude tests. Individual
+  agents have `integration-test-codex`, `integration-test-grok`, and
+  `integration-test-claude` targets. Missing prerequisites must fail, not skip.
 - Use one import block, grouped standard library, third-party, then local modules.
 - Put a concise `##` Nimdoc comment inside each procedure.
 - Let errors propagate unless this layer can meaningfully handle them.

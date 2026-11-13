@@ -249,41 +249,68 @@ Parsed tagged payloads retain their original `raw` JSON for lossless forwarding.
 That raw value takes precedence when serializing. To construct a changed payload,
 create a fresh typed value or clear its `raw` field first.
 
-## Tests and Codex integration
+## Tests and live agent integration
 
 `make test` runs deterministic Nim tests, including independent raw-wire peers.
 Scripted peers are unit tests, not evidence of live integration.
 
-Live tests use the pinned external `codex-acp` **2.6.0** adapter and an authenticated
-Codex CLI. The adapter speaks ACP and translates to Codex's separate App Server
-protocol; `codex exec --json` is not used as ACP.
-The release is validated with `codex-cli 0.167.2`.
+Live tests exercise three real agents through the same Nim suite:
+
+| Agent | ACP entry point | Validated version |
+| --- | --- | --- |
+| Codex | [codex-acp](https://github.com/agentclientprotocol/codex-acp), translating Codex App Server | Adapter 2.6.0; Codex CLI 0.167.2 |
+| Grok | Native [`grok agent stdio`](https://docs.x.ai/build/cli/headless-scripting#acp) | Grok Build 1.0.77 |
+| Claude | [claude-agent-acp](https://github.com/agentclientprotocol/claude-agent-acp), using the Claude Agent SDK | Adapter 0.106.0; bundled Claude CLI 2.1.322 |
+
+Codex and Claude adapter versions are pinned. Grok uses the installed CLI, with
+auto-update and shared leader mode disabled for the test subprocess. CLI output
+modes such as `codex exec --json` or `claude --print` are not used as ACP transports.
 
 ```sh
 make integration-setup
 make integration-test
+# Or run one provider:
+make integration-test-codex
+make integration-test-grok
+make integration-test-claude
 ```
 
-`integration-setup` uses npm to install the published adapter beneath ignored
+`integration-setup` uses npm to install both published adapters beneath ignored
 `build/integration-tools`, with installation scripts disabled. Node/npm are needed
-only for this external adapter, not for ACPort or its Nim test implementation.
-The adapter dependency resolution is recorded by npm's local lock file there.
+only for these external adapters, not for ACPort or its Nim test implementation.
+Claude's SDK supplies its matching native CLI as a platform dependency. The
+adapter dependency resolution is recorded by npm's local lock file there. Grok
+must already be installed; setup does not install or upgrade the Grok CLI.
 
-Use an existing Codex login or API-key environment. Browser login is disabled in
-tests. `ACPORT_CODEX_ACP` can select an already installed adapter; its version must
-match. `ACPORT_TEST_MODEL` optionally chooses a model; otherwise the configured
-Codex default is preserved. Tests use the installed `codex` through `CODEX_PATH`.
-Test-local approval/sandbox settings do not edit global Codex configuration.
+Use existing provider logins or the providers' supported API-key environment.
+Grok explicitly authenticates with an advertised `cached_token` or `xai.api_key`
+method and `_meta.headless = true`. Tests never start an interactive login.
+Grok sessions disable automatic approval; Claude sessions use manual mode and
+test-local SDK settings/MCP configuration. Global configuration is not edited.
 
-The suite exercises both direct ACPort-to-Codex connections and a real Nim relay
+| Override | Purpose |
+| --- | --- |
+| `ACPORT_CODEX_ACP` | Existing codex-acp executable, matching the pinned version |
+| `ACPORT_GROK` | Installed Grok executable path |
+| `ACPORT_CLAUDE_ACP` | Existing claude-agent-acp executable, matching the pinned version |
+| `ACPORT_TEST_MODEL` | Optional Codex model override |
+| `ACPORT_GROK_MODEL` | Optional Grok model override |
+| `ACPORT_CLAUDE_MODEL` | Optional Claude model override |
+
+Without model overrides, each provider's configured default is preserved. Codex
+uses the installed `codex` through `CODEX_PATH`. Claude's adapter honors its
+upstream `CLAUDE_CODE_EXECUTABLE` override if a different native CLI is required.
+
+The suite exercises both direct connections and a real Nim relay for every agent,
 using ACPort's agent and client APIs. It verifies streaming, multiple turns,
 persisted context after restart, approved and rejected file writes, cancellation,
-and another successful turn afterward. It also exercises advertised model and
-reasoning settings, legacy modes, filtered listing, close/resume without replay,
-and closing an active turn while retaining a usable connection.
+and another successful turn afterward. It also exercises readiness polling,
+advertised model and reasoning settings, legacy modes where available, filtered
+listing, close/resume without replay, and closing an active turn while retaining
+a usable connection.
 Work occurs in temporary directories.
 Missing tools, credentials, or required interactions fail rather than skip.
-Diagnostic event and stderr transcripts stay under ignored `build/`.
+Separate per-agent direct/relay event and stderr transcripts stay under ignored `build/`.
 
 This is tested core v1 interoperability, not full-protocol conformance certification.
 

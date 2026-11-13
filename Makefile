@@ -1,4 +1,4 @@
-.PHONY: setup check test test-arc test-orc integration-setup integration-test examples build/fixture-agent build/raw-agent build/session-agent
+.PHONY: setup check test test-arc test-orc integration-setup integration-test integration-test-codex integration-test-grok integration-test-claude examples build/fixture-agent build/raw-agent build/session-agent
 
 NIM ?= nim
 
@@ -31,15 +31,23 @@ test-arc:
 test-orc:
 	ACPORT_TEST_MM=orc $(MAKE) test
 
-build/codex-relay: tests/codex_relay.nim src/acport.nim src/acport/*.nim
+build/agent-relay: tests/agent_relay.nim tests/agent_profiles.nim src/acport.nim src/acport/*.nim
 	mkdir -p build
 	$(NIM) c --out:$@ $<
 
 integration-setup:
-	npm install --prefix build/integration-tools --ignore-scripts --no-audit --no-fund --save-exact @agentclientprotocol/codex-acp@2.6.0
+	npm install --prefix build/integration-tools --ignore-scripts --no-audit --no-fund --save-exact @agentclientprotocol/codex-acp@2.6.0 @agentclientprotocol/claude-agent-acp@0.106.0
 
-integration-test: build/codex-relay
+integration-test: integration-test-codex integration-test-grok integration-test-claude
+
+integration-test-codex: build/agent-relay
 	$(NIM) r --out:build/integration_codex tests/integration_codex.nim
+
+integration-test-grok: build/agent-relay
+	$(NIM) r --out:build/integration_grok tests/integration_grok.nim
+
+integration-test-claude: build/agent-relay
+	$(NIM) r --out:build/integration_claude tests/integration_claude.nim
 
 examples:
 	mkdir -p build
