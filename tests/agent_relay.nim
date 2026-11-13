@@ -32,17 +32,32 @@ proc activeContext(state: ptr RelayState, sessionId: string): RequestContext =
       session = session.next
   raise rpcError(SessionNotFound, "No active relay session")
 
-proc relayUpdate(update: SessionUpdate, userData: pointer) {.gcsafe.} =
-  ## Forward upstream updates without changing their protocol payloads.
-  let state = cast[ptr RelayState](userData)
+proc forwardNotification(state: ptr RelayState, methodName: string, params: JsonNode) {.gcsafe.} =
+  ## Retain the outer connection across asynchronous backend notification delivery.
   var upstream: Connection
   withLock state.lock:
     upstream = state.upstream
     if upstream != nil: upstream.retain()
   if upstream != nil:
-    try: upstream.notify("session/update", update.toJsonNode())
+    try: upstream.notify(methodName, params)
     except AcpTransportError: discard # The outer peer may have disconnected during delivery.
+    except AcpRpcError:
+      if methodName != "elicitation/complete": raise # A frontend cancellation can remove a URL flow first.
     finally: upstream.release()
+
+proc relayUpdate(update: SessionUpdate, userData: pointer) {.gcsafe.} =
+  ## Forward upstream events without changing commands, usage, or unknown payloads.
+  cast[ptr RelayState](userData).forwardNotification("session/update", update.toJsonNode())
+
+proc relayElicitation(context: RequestContext, request: ElicitationRequest,
+    userData: pointer): ElicitationResponse {.gcsafe.} =
+  ## Forward session-scoped interactions through their active outer prompt context.
+  if request.scope != sessionElicitationScope: raise rpcError(InvalidParams, "Live relay requires session scope")
+  cast[ptr RelayState](userData).activeContext(request.sessionId).requestElicitation(request)
+
+proc relayComplete(completion: ElicitationComplete, userData: pointer) {.gcsafe.} =
+  ## Forward a correlated completion while keeping browser/UI policy in the client.
+  cast[ptr RelayState](userData).forwardNotification("elicitation/complete", completion.toJsonNode())
 
 proc relayPermission(context: RequestContext, request: PermissionRequest,
     userData: pointer): PermissionOutcome {.gcsafe.} =
@@ -129,7 +144,10 @@ proc main() =
     deinitLock(state.lock)
     deallocShared(state)
   state.backend = newAcpClient("acport-relay", AcportVersion,
-    ClientHandlers(onUpdate: relayUpdate, onPermission: relayPermission, userData: state))
+    ClientHandlers(onUpdate: relayUpdate, onPermission: relayPermission,
+      onElicitationForm: if getEnv("ACPORT_TEST_AGENT") == "claude": relayElicitation else: nil,
+      onElicitationUrl: if getEnv("ACPORT_TEST_AGENT") == "claude": relayElicitation else: nil,
+      onElicitationComplete: relayComplete, userData: state))
   defer: state.backend.close()
   let
     profile = parseTestAgent(getEnv("ACPORT_TEST_AGENT", "codex"))

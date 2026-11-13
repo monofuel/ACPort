@@ -1,6 +1,6 @@
 import
   std/[json, locks, monotimes, os, posix, times, unicode],
-  ./[protocol, session_protocol]
+  ./[elicitation_protocol, events_protocol, protocol, session_protocol]
 
 type
   SharedText* = ptr object
@@ -18,13 +18,14 @@ type
   Task = ptr TaskObj
   Event = ptr EventObj
   Outgoing = ptr OutgoingObj
+  Elicitation = ptr ElicitationObj
 
   RequestContext* = object
     connection*: Connection
     task: Task
 
   TaskObj = object
-    id, methodName, params, sessionId: SharedText
+    id, methodName, params, sessionId, parentId: SharedText
     cancelled: bool
     running: bool
     modeRevision: uint64
@@ -38,6 +39,11 @@ type
   OutgoingObj = object
     text: SharedText
     next: Outgoing
+
+  ElicitationObj = object
+    id, rpcId, parentId, sessionId, completion: SharedText
+    outbound, accepted: bool
+    next: Elicitation
 
   PendingObj = object
     connection: Connection
@@ -73,6 +79,7 @@ type
     settings: SharedText
     sessions: Session
     pending: PendingRequest
+    elicitations: Elicitation
     outgoingHead, outgoingTail: Outgoing
     taskHead, taskTail, active: Task
     managementHead, managementTail: Task
@@ -114,7 +121,112 @@ proc destroyTask(task: Task) =
   freeText(task.methodName)
   freeText(task.params)
   freeText(task.sessionId)
+  freeText(task.parentId)
   deallocShared(task)
+
+proc destroyElicitation(record: Elicitation) =
+  ## Release connection-owned correlation state without managed cross-thread values.
+  freeText(record.id)
+  freeText(record.rpcId)
+  freeText(record.parentId)
+  freeText(record.sessionId)
+  freeText(record.completion)
+  deallocShared(record)
+
+proc clearElicitationsLocked(connection: Connection, sessionId = "", all = false) =
+  ## Drop all URL state, or only the records owned by a cancelled/closed session.
+  if not all and sessionId.len == 0: return
+  var link = addr connection.elicitations
+  while link[] != nil:
+    let record = link[]
+    if all or localText(record.sessionId) == sessionId:
+      link[] = record.next
+      destroyElicitation(record)
+    else: link = addr record.next
+
+proc cancelRpcLocked(connection: Connection, id: string, incoming: bool) =
+  ## Respect independent RPC ID namespaces when cancelling parents or nested UI requests.
+  var task = connection.active
+  while task != nil:
+    if (incoming and localText(task.id) == id) or
+        (not incoming and localText(task.methodName) == "elicitation/create" and localText(task.parentId) == id):
+      task.cancelled = true
+    task = task.activeNext
+  var link = addr connection.elicitations
+  while link[] != nil:
+    let record = link[]
+    if (record.outbound == incoming and record.parentId != nil and localText(record.parentId) == id) or
+        (record.outbound != incoming and localText(record.rpcId) == id):
+      link[] = record.next
+      destroyElicitation(record)
+    else: link = addr record.next
+  broadcast(connection.changed)
+
+proc queueEventLocked(connection: Connection, methodName, params: string) =
+  ## Append an ordered callback event while holding the state lock.
+  let event = cast[Event](allocShared0(sizeof(EventObj)))
+  event.methodName = sharedText(methodName)
+  event.params = sharedText(params)
+  inc connection.queued
+  event.sequence = connection.queued
+  if connection.eventTail == nil: connection.eventHead = event
+  else: connection.eventTail.next = event
+  connection.eventTail = event
+  broadcast(connection.changed)
+
+proc registerElicitationLocked(connection: Connection, node: JsonNode, outbound: bool) =
+  ## Reserve URL IDs at request receipt/enqueue so early completion cannot be lost.
+  if connection.closing or connection.failed: raise newException(AcpTransportError, "Connection is closed")
+  let request = parseElicitationRequest(node.field("params"))
+  if request.mode != urlElicitation: return
+  var record = connection.elicitations
+  while record != nil:
+    if record.outbound == outbound and localText(record.id) == request.elicitationId:
+      raise rpcError(InvalidParams, "Duplicate outstanding elicitationId")
+    record = record.next
+  record = cast[Elicitation](allocShared0(sizeof(ElicitationObj)))
+  record.id = sharedText(request.elicitationId)
+  record.rpcId = sharedText($node.field("id"))
+  if request.scope == requestElicitationScope: record.parentId = sharedText($request.requestId)
+  else: record.sessionId = sharedText(request.sessionId)
+  record.outbound = outbound
+  record.next = connection.elicitations
+  connection.elicitations = record
+
+proc settleElicitationLocked(connection: Connection, node: JsonNode, outbound: bool) =
+  ## Retain accepted URL flows and release rejected, cancelled, or completed ones.
+  var link = addr connection.elicitations
+  while link[] != nil:
+    let record = link[]
+    if record.outbound == outbound and localText(record.rpcId) == $node.field("id"):
+      if node.hasKey("result") and node["result"].field("action").getStr() == "accept":
+        record.accepted = true
+        if outbound or record.completion == nil: return
+        connection.queueEventLocked("elicitation/complete", localText(record.completion))
+      link[] = record.next
+      destroyElicitation(record)
+      return
+    link = addr record.next
+
+proc completeElicitationLocked(connection: Connection, params: JsonNode, outbound: bool) =
+  ## Buffer early consent completion and suppress unknown or duplicate inbound IDs.
+  if connection.closing or connection.failed:
+    if outbound: raise newException(AcpTransportError, "Connection is closed")
+    return
+  let completion = parseElicitationComplete(params)
+  var link = addr connection.elicitations
+  while link[] != nil:
+    let record = link[]
+    if record.outbound == outbound and localText(record.id) == completion.elicitationId:
+      if not outbound and not record.accepted:
+        if record.completion == nil: record.completion = sharedText($params)
+        return
+      if not outbound: connection.queueEventLocked("elicitation/complete", $params)
+      link[] = record.next
+      destroyElicitation(record)
+      return
+    link = addr record.next
+  if outbound: raise rpcError(InvalidParams, "Unknown outstanding elicitationId")
 
 proc retain*(connection: Connection) =
   ## Keep connection state alive for an entire public API operation.
@@ -127,6 +239,7 @@ proc release*(connection: Connection) =
   let last = connection.references == 0
   release(connection.lock)
   if last:
+    connection.clearElicitationsLocked(all = true)
     var session = connection.sessions
     while session != nil:
       let next = session.next
@@ -153,6 +266,7 @@ proc fail(connection: Connection, message: string, protocol = false) =
     while task != nil:
       task.cancelled = true
       task = task.activeNext
+    connection.clearElicitationsLocked(all = true)
     broadcast(connection.changed)
 
 proc isStopped(connection: Connection): bool =
@@ -189,11 +303,18 @@ proc applyUpdateLocked(connection: Connection, params: JsonNode) =
     id = params.requiredString("sessionId")
     update = params.field("update")
     kind = update.field("sessionUpdate").getStr()
-  if kind notin ["config_option_update", "current_mode_update", "session_info_update"]: return
+  if kind notin ["config_option_update", "current_mode_update", "session_info_update",
+      "available_commands_update", "usage_update"]: return
   let
     session = connection.sessionLocked(id, true)
     snapshot = session.snapshotLocked()
   case kind
+  of "available_commands_update":
+    discard parseAvailableCommands(update.field("availableCommands"))
+    snapshot["availableCommands"] = update["availableCommands"]
+  of "usage_update":
+    discard parseUsage(update)
+    snapshot["usage"] = update
   of "config_option_update":
     discard parseConfigOptions(update.field("configOptions"))
     snapshot["configOptions"] = update["configOptions"]
@@ -250,6 +371,7 @@ proc applyResponseLocked(connection: Connection, methodName: string, params,
       snapshot["modes"]["currentModeId"] = params.field("modeId")
   else:
     session.closed = true
+    connection.clearElicitationsLocked(id)
     session.closing = false
     session.busy = false
   session.saveSnapshotLocked(snapshot)
@@ -279,6 +401,7 @@ proc markSessionClosing*(connection: Connection, id: string) =
   withLock connection.lock:
     let session = connection.sessionLocked(id, true)
     if not session.closed: session.closing = true
+    connection.clearElicitationsLocked(id)
 
 proc beginSessionClose*(context: RequestContext, id: string): bool =
   ## Cancel session work before application cleanup, without cancelling the close itself.
@@ -287,6 +410,7 @@ proc beginSessionClose*(context: RequestContext, id: string): bool =
     let session = connection.sessionLocked(id)
     if session == nil or not session.known or session.closed: return false
     session.closing = true
+    connection.clearElicitationsLocked(id)
     var task = connection.active
     while task != nil:
       if task != context.task and localText(task.sessionId) == id and
@@ -325,12 +449,20 @@ proc enqueue(connection: Connection, node: JsonNode) =
         raise newException(AcpTransportError, "Connection is closed")
       if node.field("method").getStr() == "session/update":
         connection.applyUpdateLocked(node.field("params"))
-      elif node.hasKey("result"):
+      elif node.field("method").getStr() == "elicitation/create":
+        connection.registerElicitationLocked(node, true)
+      elif node.field("method").getStr() == "elicitation/complete":
+        connection.completeElicitationLocked(node.field("params"), true)
+      elif node.field("method").getStr() == "$/cancel_request":
+        connection.cancelRpcLocked($node.field("params").field("requestId"), false)
+      elif node.hasKey("result") or node.hasKey("error"):
+        connection.settleElicitationLocked(node, false)
         var task = connection.active
         while task != nil:
           if localText(task.id) == $node.field("id"):
-            connection.applyResponseLocked(localText(task.methodName), parseJson(localText(task.params)),
-              node["result"], task.modeRevision)
+            if node.hasKey("result"):
+              connection.applyResponseLocked(localText(task.methodName), parseJson(localText(task.params)),
+                node["result"], task.modeRevision)
             break
           task = task.activeNext
       if connection.outgoingTail == nil: connection.outgoingHead = outgoing
@@ -386,9 +518,15 @@ proc userData*(context: RequestContext): pointer =
   ## Return application-owned context registered before the connection starts.
   context.connection.userData
 
+proc getRequestId*(context: RequestContext): JsonNode =
+  ## Copy the current RPC identifier without exposing an incoming task pointer.
+  if context.task == nil: raise newException(ValueError, "Context has no request identifier")
+  parseJson(localText(context.task.id))
+
 proc cancelSession*(connection: Connection, sessionId: string) =
   ## Signal session handlers and wake permission waiters immediately.
   withLock connection.lock:
+    connection.clearElicitationsLocked(sessionId)
     var task = connection.active
     while task != nil:
       if localText(task.sessionId) == sessionId: task.cancelled = true
@@ -399,6 +537,14 @@ proc cancel*(connection: Connection, sessionId: string) =
   ## Cancel a peer session without terminating the underlying connection.
   connection.cancelSession(sessionId)
   connection.notify("session/cancel", %*{"sessionId": sessionId})
+
+proc destroyPending(pending: PendingRequest) =
+  ## Release an owned pending record after it is removed from the routing list.
+  freeText(pending.sessionId)
+  freeText(pending.methodName)
+  freeText(pending.params)
+  freeText(pending.response)
+  deallocShared(pending)
 
 proc startRequest*(connection: Connection, methodName: string,
     params: JsonNode): PendingRequest =
@@ -430,6 +576,14 @@ proc startRequest*(connection: Connection, methodName: string,
   try:
     connection.enqueue(%*{"jsonrpc": "2.0", "id": result.id,
       "method": methodName, "params": params})
+  except AcpRpcError:
+    withLock connection.lock:
+      var link = addr connection.pending
+      while link[] != result: link = addr link[].next
+      link[] = result.next
+    destroyPending(result)
+    connection.release()
+    raise
   except CatchableError as error:
     connection.fail(error.msg, error of AcpProtocolError or error of AcpRpcError)
 
@@ -446,14 +600,6 @@ proc timedWait(connection: Connection, milliseconds: int) =
     let code = pthread_cond_timedwait(cast[ptr Pthread_cond](addr connection.changed),
       cast[ptr Pthread_mutex](addr connection.lock), addr deadline)
     if code != 0 and code != ETIMEDOUT: raiseOSError(OSErrorCode(code))
-
-proc destroyPending(pending: PendingRequest) =
-  ## Release an owned pending record after it is removed from the routing list.
-  freeText(pending.sessionId)
-  freeText(pending.methodName)
-  freeText(pending.params)
-  freeText(pending.response)
-  deallocShared(pending)
 
 proc isReady*(pending: PendingRequest): bool =
   ## Test the waiter's completion conditions under the connection lock.
@@ -614,21 +760,10 @@ proc sendError(connection: Connection, id: JsonNode, code: int, message: string,
 
 proc queueEvent(connection: Connection, methodName: string, params: string) =
   ## Transfer callback input without sharing thread-local managed strings.
-  let event = cast[Event](allocShared0(sizeof(EventObj)))
-  event.methodName = sharedText(methodName)
-  event.params = sharedText(params)
   withLock connection.lock:
     if connection.closing or connection.failed:
-      freeText(event.methodName)
-      freeText(event.params)
-      deallocShared(event)
       return
-    inc connection.queued
-    event.sequence = connection.queued
-    if connection.eventTail == nil: connection.eventHead = event
-    else: connection.eventTail.next = event
-    connection.eventTail = event
-    broadcast(connection.changed)
+    connection.queueEventLocked(methodName, params)
 
 proc handleLine(connection: Connection, line: string) =
   ## Route one independently framed JSON-RPC message.
@@ -661,27 +796,35 @@ proc handleLine(connection: Connection, line: string) =
         connection.cancelSession(params.field("sessionId").getStr())
       elif methodName == "$/cancel_request":
         withLock connection.lock:
-          var task = connection.active
-          while task != nil:
-            if localText(task.id) == $params.field("requestId"): task.cancelled = true
-            task = task.activeNext
-          broadcast(connection.changed)
-      if methodName == "session/update" or methodName == "session/cancel":
+          connection.cancelRpcLocked($params.field("requestId"), true)
+      elif methodName == "elicitation/complete":
+        withLock connection.lock: connection.completeElicitationLocked(params, false)
+      if methodName == "session/update" or methodName == "session/cancel" or
+          (methodName.len > 1 and methodName[0] == '_'):
         connection.queueEvent(methodName, $params)
     else:
+      if methodName == "elicitation/create":
+        try:
+          withLock connection.lock: connection.registerElicitationLocked(node, false)
+        except AcpRpcError as error:
+          connection.sendError(node["id"], error.code, error.msg, error.data)
+          return
       let task = cast[Task](allocShared0(sizeof(TaskObj)))
       task.id = sharedText($node["id"])
       task.methodName = sharedText(methodName)
       task.params = sharedText($params)
       task.sessionId = sharedText(params.field("sessionId").getStr())
+      if methodName == "elicitation/create" and params.hasKey("requestId"):
+        task.parentId = sharedText($params["requestId"])
       withLock connection.lock:
         if connection.closing or connection.failed:
-          freeText(task.id)
-          freeText(task.methodName)
-          freeText(task.params)
-          freeText(task.sessionId)
-          deallocShared(task)
+          destroyTask(task)
           return
+        if task.parentId != nil:
+          var pending = connection.pending
+          while pending != nil:
+            if $pending.id == localText(task.parentId) and pending.abandoned: task.cancelled = true
+            pending = pending.next
         task.activeNext = connection.active
         connection.active = task
         let session = connection.sessionLocked(params.field("sessionId").getStr())
@@ -716,11 +859,13 @@ proc handleLine(connection: Connection, line: string) =
       var pending = connection.pending
       while pending != nil:
         if node["id"].kind == JInt and pending.id == node["id"].getInt():
+          connection.settleElicitationLocked(node, true)
           let methodName = localText(pending.methodName)
           if node.hasKey("result"):
             connection.applyResponseLocked(methodName, parseJson(localText(pending.params)),
               node["result"], pending.modeRevision)
           elif methodName == "session/close" and node["error"].field("code").getInt() == SessionNotFound:
+            connection.clearElicitationsLocked(localText(pending.sessionId))
             let session = connection.sessionLocked(localText(pending.sessionId), true)
             session.closed = true
             session.closing = false
@@ -967,6 +1112,7 @@ proc close*(connection: Connection) =
   ## Stop and join background threads; outstanding handles retain failure state.
   withLock connection.lock:
     connection.closing = true
+    connection.clearElicitationsLocked(all = true)
     var task = connection.active
     while task != nil:
       task.cancelled = true

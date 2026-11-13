@@ -1,17 +1,29 @@
 import
   std/[json, options, os, strtabs],
-  ./[connection, processes, protocol, session_protocol]
+  ./[connection, elicitation_protocol, events_protocol, processes, protocol, session_protocol]
 
-export RequestContext, LogHandler, isCancelled
+export RequestContext, LogHandler, getRequestId, isCancelled
 
 type
   UpdateHandler* = proc(update: SessionUpdate, userData: pointer) {.nimcall, gcsafe.}
   PermissionHandler* = proc(context: RequestContext, request: PermissionRequest,
     userData: pointer): PermissionOutcome {.nimcall, gcsafe.}
+  ExtensionRequestHandler* = proc(context: RequestContext, methodName: string,
+    params: JsonNode, userData: pointer): JsonNode {.nimcall, gcsafe.}
+  ExtensionNotificationHandler* = proc(methodName: string, params: JsonNode,
+    userData: pointer) {.nimcall, gcsafe.}
+  ElicitationHandler* = proc(context: RequestContext, request: ElicitationRequest,
+    userData: pointer): ElicitationResponse {.nimcall, gcsafe.}
+  ElicitationCompleteHandler* = proc(completion: ElicitationComplete,
+    userData: pointer) {.nimcall, gcsafe.}
   ClientHandlers* = object
     onUpdate*: UpdateHandler
     onPermission*: PermissionHandler
     onLog*: LogHandler
+    onElicitationForm*, onElicitationUrl*: ElicitationHandler
+    onElicitationComplete*: ElicitationCompleteHandler
+    onExtensionRequest*: ExtensionRequestHandler
+    onExtensionNotification*: ExtensionNotificationHandler
     userData*: pointer
 
   NewSessionHandler* = proc(context: RequestContext, request: SessionRequest,
@@ -39,6 +51,8 @@ type
     onCloseSession*: CloseSessionHandler
     onSetConfigOption*: SetConfigOptionHandler
     onSetMode*: SetModeHandler
+    onExtensionRequest*: ExtensionRequestHandler
+    onExtensionNotification*: ExtensionNotificationHandler
     userData*: pointer
 
   AcpClient* = ptr object
@@ -50,6 +64,7 @@ type
   AcpAgent* = ptr object
     info, authMethods: SharedText
     handlers: AgentHandlers
+    extensionCapabilities, meta: SharedText
 
   AcpSession* = object
     client*: AcpClient
@@ -105,6 +120,51 @@ proc getSessionInfo*(session: AcpSession): Option[SessionInfo] =
   let info = connection.sessionSnapshot(session.id).field("info")
   if info.field("cwd").kind == JString: result = some(parseSessionInfo(info))
 
+proc getAvailableCommands*(session: AcpSession): seq[AvailableCommand] =
+  ## Copy the latest complete command catalog, or an empty list before reporting.
+  let connection = session.client.requireConnection()
+  defer: connection.release()
+  let commands = connection.sessionSnapshot(session.id).field("availableCommands")
+  if commands.kind != JNull: result = parseAvailableCommands(commands)
+
+proc getUsage*(session: AcpSession): Option[UsageUpdate] =
+  ## Copy the latest absolute usage report without inventing unreported usage.
+  let connection = session.client.requireConnection()
+  defer: connection.release()
+  let usage = connection.sessionSnapshot(session.id).field("usage")
+  if usage.kind != JNull: result = some(parseUsage(usage))
+
+proc requireExtension(methodName: string) =
+  ## Keep custom calls in ACP's reserved extension namespace.
+  if methodName.len < 2 or methodName[0] != '_':
+    raise newException(ValueError, "Extension method names must start with '_' and include a name")
+
+proc requestExtension*(client: AcpClient, methodName: string, params: JsonNode,
+    timeoutMs = 0): JsonNode =
+  ## Make a custom request without interpreting its opaque application payload.
+  requireExtension(methodName)
+  let connection = client.requireConnection()
+  defer: connection.release()
+  connection.request(methodName, params, timeoutMs)
+
+proc notifyExtension*(client: AcpClient, methodName: string, params: JsonNode) =
+  ## Send a custom notification without expecting a response.
+  requireExtension(methodName)
+  let connection = client.requireConnection()
+  defer: connection.release()
+  connection.notify(methodName, params)
+
+proc requestExtension*(context: RequestContext, methodName: string, params: JsonNode,
+    timeoutMs = 0): JsonNode =
+  ## Make a nested extension request that cooperates with parent cancellation.
+  requireExtension(methodName)
+  context.connection.request(methodName, params, timeoutMs, context)
+
+proc notifyExtension*(context: RequestContext, methodName: string, params: JsonNode) =
+  ## Publish a custom notification during a live handler.
+  requireExtension(methodName)
+  context.connection.notify(methodName, params)
+
 proc requireCapability(connection: Connection, capability: string) =
   ## Guard optional lifecycle methods before sending a request to the peer.
   if connection.settings().field("agentCapabilities").field("sessionCapabilities").field(capability).kind != JObject:
@@ -139,11 +199,51 @@ proc requestPermission*(context: RequestContext, permission: PermissionRequest,
       if option.optionId == result.optionId: found = true
     if not found: raise newException(AcpProtocolError, "Peer selected an unknown permission option")
 
+proc requestElicitation*(context: RequestContext, request: ElicitationRequest,
+    timeoutMs = 0): ElicitationResponse =
+  ## Ask an explicitly supported mode, preserving cancellation and opaque form data.
+  if context.isCancelled(): return ElicitationResponse(action: cancelElicitation)
+  var effective = request
+  if effective.raw == nil and effective.scope == requestElicitationScope and effective.requestId == nil:
+    effective.requestId = context.getRequestId()
+  let params = effective.toJsonNode()
+  let parsed = parseElicitationRequest(params)
+  let mode = case parsed.mode
+    of formElicitation: "form"
+    of urlElicitation: "url"
+    else: raise newException(AcpProtocolError, "Unsupported elicitation mode")
+  if context.connection.settings().field("clientCapabilities").field("elicitation").field(mode).kind != JObject:
+    raise newException(AcpProtocolError, "Client did not advertise elicitation mode: " & mode)
+  try:
+    result = parseElicitationResponse(context.connection.request("elicitation/create", params, timeoutMs, context))
+  except AcpCancelledError:
+    result = ElicitationResponse(action: cancelElicitation)
+
+proc completeElicitation*(context: RequestContext, elicitationId: string, meta: JsonNode = nil) =
+  ## Report external URL-flow completion during a live handler without opening the URL.
+  if context.isCancelled(): raise newException(AcpCancelledError, "Elicitation context cancelled")
+  context.connection.notify("elicitation/complete", ElicitationComplete(elicitationId: elicitationId, meta: meta).toJsonNode())
+
 proc clientRequest(context: RequestContext, methodName: string,
     params: JsonNode): JsonNode {.gcsafe.} =
   ## Dispatch agent requests to the application's explicit permission policy.
   let client = cast[AcpClient](context.userData())
+  if methodName == "elicitation/create":
+    let request = parseElicitationRequest(params)
+    let handler = case request.mode
+      of formElicitation: client.handlers.onElicitationForm
+      of urlElicitation: client.handlers.onElicitationUrl
+      else: nil
+    if handler == nil: raise rpcError(InvalidParams, "Elicitation mode was not advertised")
+    if context.isCancelled(): return ElicitationResponse(action: cancelElicitation).toJsonNode()
+    let response = handler(context, request, client.handlers.userData)
+    if context.isCancelled(): return ElicitationResponse(action: cancelElicitation).toJsonNode()
+    result = response.toJsonNode()
+    discard parseElicitationResponse(result)
+    return
   if methodName != "session/request_permission":
+    if methodName.len > 1 and methodName[0] == '_' and client.handlers.onExtensionRequest != nil:
+      return client.handlers.onExtensionRequest(context, methodName, params, client.handlers.userData)
     raise rpcError(MethodNotFound, "Method not found: " & methodName)
   let permission = parsePermission(params)
   var outcome = PermissionOutcome(outcome: "cancelled")
@@ -167,6 +267,10 @@ proc clientNotification(context: RequestContext, methodName: string,
     let update = parseUpdate(params)
     if client.handlers.onUpdate != nil:
       client.handlers.onUpdate(update, client.handlers.userData)
+  elif methodName.len > 1 and methodName[0] == '_' and client.handlers.onExtensionNotification != nil:
+    client.handlers.onExtensionNotification(methodName, params, client.handlers.userData)
+  elif methodName == "elicitation/complete" and client.handlers.onElicitationComplete != nil:
+    client.handlers.onElicitationComplete(parseElicitationComplete(params), client.handlers.userData)
 
 proc clientLog(userData: pointer, text: string) {.gcsafe.} =
   ## Forward child diagnostics without mixing stderr into protocol traffic.
@@ -196,14 +300,24 @@ proc connect*(client: AcpClient, command: string, args: seq[string] = @[],
     client.process.close()
     raise
 
-proc initialize*(client: AcpClient, timeoutMs = 0): InitializeResponse =
+proc initialize*(client: AcpClient, timeoutMs = 0, extensionCapabilities: JsonNode = nil,
+    meta: JsonNode = nil): InitializeResponse =
   ## Negotiate ACP v1 without advertising unimplemented client capabilities.
   if client.connection == nil: raise newException(AcpTransportError, "Client is not connected")
   if client.connection.isInitialized(): raise newException(AcpProtocolError, "Already initialized")
-  let response = client.connection.request("initialize", %*{
+  var params = %*{
     "protocolVersion": ProtocolVersion,
     "clientCapabilities": {"session": {"configOptions": {"boolean": {}}}},
-    "clientInfo": parseJson(localText(client.info))}, timeoutMs)
+    "clientInfo": parseJson(localText(client.info))}
+  var elicitation = newJObject()
+  if client.handlers.onElicitationForm != nil: elicitation["form"] = newJObject()
+  if client.handlers.onElicitationUrl != nil: elicitation["url"] = newJObject()
+  if elicitation.len > 0: params["clientCapabilities"]["elicitation"] = elicitation
+  if extensionCapabilities != nil and extensionCapabilities.kind != JNull:
+    extensionCapabilities.requireObject()
+    params["clientCapabilities"]["_meta"] = extensionCapabilities
+  if meta != nil: params["_meta"] = meta
+  let response = client.connection.request("initialize", params, timeoutMs)
   if response.field("protocolVersion").kind != JInt or
       response["protocolVersion"].getInt() != ProtocolVersion:
     raise newException(AcpProtocolError, "Peer did not negotiate ACP v1; close this connection")
@@ -407,10 +521,15 @@ proc agentRequest(context: RequestContext, methodName: string,
     if agent.handlers.onListSessions != nil: capabilities["sessionCapabilities"]["list"] = newJObject()
     if agent.handlers.onResumeSession != nil: capabilities["sessionCapabilities"]["resume"] = newJObject()
     if agent.handlers.onCloseSession != nil: capabilities["sessionCapabilities"]["close"] = newJObject()
-    return %*{"protocolVersion": ProtocolVersion,
+    let extensions = parseJson(localText(agent.extensionCapabilities))
+    if extensions.kind != JNull: capabilities["_meta"] = extensions
+    result = %*{"protocolVersion": ProtocolVersion,
       "agentInfo": parseJson(localText(agent.info)),
       "agentCapabilities": capabilities,
       "authMethods": parseJson(localText(agent.authMethods))}
+    let meta = parseJson(localText(agent.meta))
+    if meta.kind != JNull: result["_meta"] = meta
+    return
   if not context.connection.isInitialized(): raise rpcError(InvalidRequest, "Not initialized")
   case methodName
   of "authenticate":
@@ -484,6 +603,8 @@ proc agentRequest(context: RequestContext, methodName: string,
     finally:
       context.connection.endPrompt(request.sessionId)
   else:
+    if methodName.len > 1 and methodName[0] == '_' and agent.handlers.onExtensionRequest != nil:
+      return agent.handlers.onExtensionRequest(context, methodName, params, agent.handlers.userData)
     raise rpcError(MethodNotFound, "Method not found: " & methodName)
 
 proc agentNotification(context: RequestContext, methodName: string,
@@ -492,9 +613,12 @@ proc agentNotification(context: RequestContext, methodName: string,
   let agent = cast[AcpAgent](context.userData())
   if methodName == "session/cancel" and agent.handlers.onCancel != nil:
     agent.handlers.onCancel(params.requiredString("sessionId"), agent.handlers.userData)
+  elif methodName.len > 1 and methodName[0] == '_' and agent.handlers.onExtensionNotification != nil:
+    agent.handlers.onExtensionNotification(methodName, params, agent.handlers.userData)
 
 proc newAcpAgent*(name: string, version: string, handlers: AgentHandlers,
-    authMethods: seq[JsonNode] = @[]): AcpAgent =
+    authMethods: seq[JsonNode] = @[], extensionCapabilities: JsonNode = nil,
+    meta: JsonNode = nil): AcpAgent =
   ## Construct an agent around application-owned behavior and session storage.
   if handlers.onNewSession == nil or handlers.onPrompt == nil:
     raise newException(ValueError, "An agent requires session creation and prompt handlers")
@@ -505,9 +629,12 @@ proc newAcpAgent*(name: string, version: string, handlers: AgentHandlers,
     discard authMethod.requiredString("name")
     if authMethod.field("type").getStr("agent") != "agent":
       raise newException(ValueError, "Only agent-managed authentication is supported")
+  if extensionCapabilities != nil and extensionCapabilities.kind != JNull: extensionCapabilities.requireObject()
   result = cast[AcpAgent](allocShared0(sizeof(result[])))
   result.info = sharedText($(%*{"name": name, "version": version}))
   result.authMethods = sharedText($(%authMethods))
+  result.extensionCapabilities = sharedText($(if extensionCapabilities == nil: newJNull() else: extensionCapabilities))
+  result.meta = sharedText($(if meta == nil: newJNull() else: meta))
   result.handlers = handlers
 
 proc runStdioAgent*(agent: AcpAgent, workerThreads = DefaultWorkerThreads) =
@@ -521,4 +648,6 @@ proc close*(agent: AcpAgent) =
   ## Release an agent after runStdioAgent and its handlers have returned.
   freeText(agent.info)
   freeText(agent.authMethods)
+  freeText(agent.extensionCapabilities)
+  freeText(agent.meta)
   deallocShared(agent)

@@ -1,4 +1,4 @@
-version     = "1.1.1"
+version     = "1.2.0"
 author      = "monofuel"
 description = "Nim Agent Client Protocol client and agent library"
 license     = "MIT"

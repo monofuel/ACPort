@@ -8,7 +8,7 @@ type
   Capture = object
     lock: Lock
     text: SharedText
-    tools, updates, permissions, history: int
+    tools, updates, permissions, history, elicitations: int
     reject: bool
     agent: TestAgent
     relay: bool
@@ -55,12 +55,41 @@ proc onLog(userData: pointer, text: string) {.gcsafe.} =
   log.write(text)
   log.close()
 
+proc onForm(context: RequestContext, request: ElicitationRequest,
+    userData: pointer): ElicitationResponse {.gcsafe.} =
+  ## Answer the real Claude question using its advertised enum value, not guessed field IDs.
+  let state = cast[ptr Capture](userData)
+  result = ElicitationResponse(action: acceptElicitation, content: newJObject())
+  var matched = false
+  for key, property in request.requestedSchema.field("properties"):
+    let choices = property.field("oneOf")
+    if choices.kind == JArray:
+      for choice in choices:
+        if choice.field("const").getStr().toLowerAscii() == "cobalt":
+          result.content[key] = choice["const"]
+          matched = true
+    let values = property.field("enum")
+    if values.kind == JArray:
+      for choice in values:
+        if choice.getStr().toLowerAscii() == "cobalt":
+          result.content[key] = choice
+          matched = true
+  if not matched: raise newException(ValueError, "Claude did not offer the required cobalt choice")
+  withLock state.lock: inc state.elicitations
+
+proc onUrl(context: RequestContext, request: ElicitationRequest,
+    userData: pointer): ElicitationResponse {.gcsafe.} =
+  ## Decline external interactions in live tests without navigating or starting login.
+  ElicitationResponse(action: declineElicitation)
+
 proc connectAgent(state: ptr Capture): AcpClient =
   ## Connect to the pinned adapter directly or through the Nim agent relay.
   let command = state.agent.agentCommand()
   command.environment["ACPORT_TEST_AGENT"] = $state.agent
   result = newAcpClient("acport-integration", AcportVersion,
-    ClientHandlers(onUpdate: onUpdate, onPermission: onPermission, onLog: onLog, userData: state))
+    ClientHandlers(onUpdate: onUpdate, onPermission: onPermission, onLog: onLog,
+      onElicitationForm: if state.agent == claude: onForm else: nil,
+      onElicitationUrl: if state.agent == claude: onUrl else: nil, userData: state))
   try:
     result.connect(if state.relay: absolutePath("build/agent-relay") else: command.command,
       if state.relay: @[] else: command.args, environment = command.environment)
@@ -145,6 +174,16 @@ proc runLive*(agent: TestAgent, relay: bool) =
     doAssert session.prompt("What word did I ask you to remember? Reply with only that word. Do not use tools.",
       TestDeadlineMs).stopReason == endTurn
     doAssert state.capturedText().toLowerAscii().contains("cobalt")
+    doAssert session.getAvailableCommands().len > 0, $agent & " must advertise commands"
+    if agent != grok: doAssert session.getUsage().isSome, $agent & " must report context usage"
+    if agent == claude:
+      state.resetCapture()
+      doAssert session.prompt("Use AskUserQuestion to ask me one single-choice color question. " &
+        "Offer Cobalt and Crimson as the two choices, with Cobalt first. " &
+        "You must invoke the question tool and wait for my answer; do not guess it. " &
+        "After receiving my answer, reply with that color only.", TestDeadlineMs).stopReason == endTurn
+      withLock state.lock: doAssert state.elicitations > 0
+      doAssert state.capturedText().toLowerAscii().contains("cobalt")
     session.closeSession(60_000)
     state.resetCapture()
     discard client.resumeSession(sessionId, directory, timeoutMs = 90_000, meta = agent.sessionMeta())

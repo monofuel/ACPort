@@ -4,6 +4,6 @@ when not defined(linux):
   {.error: "ACPort stdio transport currently supports Linux only.".}
 
 import
-  acport/[api, protocol, session_protocol]
+  acport/[api, elicitation_protocol, events_protocol, protocol, session_protocol]
 
-export api, protocol, session_protocol
+export api, elicitation_protocol, events_protocol, protocol, session_protocol

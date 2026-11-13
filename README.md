@@ -3,7 +3,7 @@
 A threaded Nim library for [Agent Client Protocol](https://agentclientprotocol.com/)
 clients and agents. A sibling to [MCPort](https://github.com/monofuel/MCPort).
 
-## ACPort 1.1
+## ACPort 1.2
 
 Supports core **ACP v1 over Linux stdio**, with both client and agent/server APIs:
 
@@ -16,17 +16,20 @@ Supports core **ACP v1 over Linux stdio**, with both client and agent/server API
 - Permission requests with explicit approval, rejection, or cancellation.
 - Cooperative session cancellation and request deadlines.
 - Unknown update payloads and `_meta` preservation for forwarding.
+- Bidirectional custom request/notification hooks and extension capability metadata.
+- Typed command catalogs and absolute usage/cost snapshots.
+- Opt-in form and URL elicitation, with cancellation and correlated URL completion.
 
 The implementation targets the stable v1 schema at
 [`c392d7e9d1de01337b749c0070929933e9f6f09f`](https://github.com/agentclientprotocol/agent-client-protocol/blob/c392d7e9d1de01337b749c0070929933e9f6f09f/schema/v1/schema.json).
-The package version `1.1.1` and the wire protocol version `1` are separate.
+The package version `1.2.0` and the wire protocol version `1` are separate.
 
 The library uses threads, locks, and condition variables, without asyncdispatch.
 Its only package dependency is [jsony](https://github.com/treeform/jsony), pinned
 in `nimby.lock`. HTTP libraries and MCPort are not required.
 
 HTTP/WebSocket transport, ACP v2, client filesystem and terminal execution,
-persisted session deletion, and vendor-specific extensions are outside 1.1.
+persisted session deletion, and vendor-specific implementations are outside 1.2.
 Unknown update variants remain available as raw JSON.
 Client filesystem, terminal, and other unsupported capabilities are not advertised.
 An agent advertises lifecycle capabilities only when the corresponding handlers exist.
@@ -188,6 +191,83 @@ reason. A request context provides:
 Agents supply their own tools, MCP connections, LLM integration, authentication
 policy, and persistence. ACPort does not automatically execute reported tool calls.
 
+## Extensions and typed event state
+
+`client.requestExtension(methodName, params, timeoutMs)` makes a blocking custom
+request; `client.notifyExtension(methodName, params)` sends a notification. The
+same helpers on `RequestContext` support the agent direction and parent-request
+cancellation. Supply the complete wire method name, such as
+`_com.example/inspect`; standard methods cannot be invoked through these helpers.
+
+Install `onExtensionRequest` and `onExtensionNotification` in either handler
+record to receive custom calls. Request handlers receive a context, method name,
+opaque JSON parameters, and `userData`, and return JSON or raise `AcpRpcError`.
+Notification handlers receive the name, parameters, and `userData` on the ordered
+callback thread. An unhandled request returns `MethodNotFound`; an unhandled
+notification is ignored. Extensions never replace standard protocol handlers.
+
+`initialize(..., extensionCapabilities = payload, meta = metadata)` and
+`newAcpAgent(..., extensionCapabilities = payload, meta = metadata)` carry custom
+capabilities under the corresponding capabilities' `_meta`, separately from
+initialization-level `_meta`. Retained metadata is copied into shared buffers.
+Applications decide which peer extension capabilities to require.
+
+`getAvailableCommands()` returns the latest complete command catalog, including
+optional input hints. An empty catalog clears previously advertised commands.
+Run a command through a normal prompt, such as `session.prompt("/inspect path")`.
+`getUsage()` returns `Option[UsageUpdate]` with `used`, `size`, and optional
+cumulative `cost` (`amount` and `currency`). Unreported usage is `none`; a report
+with zero counts is a valid snapshot. Each report replaces the previous one,
+including its optional cost; values are not accumulated.
+
+Both getters return owned snapshots updated in wire order before callbacks.
+`parseAvailableCommandsUpdate` and `parseUsageUpdate` decode their `unknownUpdate`
+events, and `availableCommandsUpdate` / `usageUpdate` construct notifications for
+agent handlers. The existing `UpdateKind` enum and initial `session.state`
+snapshot remain source compatible.
+
+## Elicitation
+
+Install `ClientHandlers.onElicitationForm` and/or `onElicitationUrl` to opt into
+those modes. ACPort advertises only installed modes. Each handler receives an
+`ElicitationRequest` and returns an `ElicitationResponse` with `acceptElicitation`,
+`declineElicitation`, or `cancelElicitation`. Unknown modes/actions retain raw
+payloads for forwarding and are never interpreted as acceptance. Requests for
+unadvertised modes fail with `InvalidParams`.
+
+Requests have explicit `formElicitation` or `urlElicitation` modes and either
+`sessionElicitationScope` (with optional `toolCallId`) or
+`requestElicitationScope`. `requestedSchema` and response `content` are JSON.
+ACPort validates envelope and wire-value types; applications render the form and
+validate answers against its schema. Form mode is for non-secret information.
+Unknown fields and `_meta` remain available through the original raw payload.
+
+An agent handler calls `context.requestElicitation(request, timeoutMs)` after
+checking the application's desired interaction. ACPort checks the peer's mode
+capability. In a constructed request-scoped envelope, an omitted `requestId`
+defaults to the current context's RPC identifier. `context.getRequestId()` returns
+an owned JSON identifier when explicit correlation is needed, including string
+and null IDs. Request scope works during authentication before any session exists.
+
+For URL mode, `accept` means consent to the interaction, not completion of the
+external operation. The application must show the full URL and obtain consent
+before opening it in a suitable external context; ACPort never opens or fetches
+URLs. Use `context.completeElicitation(id, meta)` during a live handler to report
+completion, and `onElicitationComplete` to observe it. Credential handling and
+verification of the external user remain application responsibilities.
+
+URL IDs are unique among outstanding flows on each connection. Completion
+arriving before the consent response is buffered until acceptance; decline or
+cancellation discards it. Unknown and duplicate completions are ignored. Session
+cancellation/closure, parent-request cancellation, and disconnect discard the
+associated URL state. Reuse an ID only after its previous flow has ended.
+
+Elicitation callbacks run on request workers and must honor
+`context.isCancelled()`. Parent cancellation produces a cancelled interaction;
+explicit deadlines and transport failures retain ACPort's normal exceptions.
+Completion callbacks run on the ordered callback thread. Keep all callbacks and
+their `userData` alive until connection shutdown finishes.
+
 ## Permissions, cancellation, and errors
 
 Install `ClientHandlers.onPermission` to select one of the request's option IDs.
@@ -223,7 +303,7 @@ is freed and must not be used or closed again. Release an agent only after
 Prompt and permission handlers run on a worker pool. Session setup, lifecycle and
 configuration handlers run on a separate serial management thread, so a full
 prompt pool cannot starve them. Protect application state accessed from both.
-Update and diagnostic callbacks run on one
+Update, extension-notification, elicitation-completion, and diagnostic callbacks run on one
 ordered callback thread per connection. The reader and writer never invoke
 application callbacks. Callbacks must return promptly and cannot make blocking
 calls on the same connection; start work on another application thread instead.
@@ -305,9 +385,14 @@ The suite exercises both direct connections and a real Nim relay for every agent
 using ACPort's agent and client APIs. It verifies streaming, multiple turns,
 persisted context after restart, approved and rejected file writes, cancellation,
 and another successful turn afterward. It also exercises readiness polling,
-advertised model and reasoning settings, legacy modes where available, filtered
+typed command catalogs, usage where reported, advertised model and reasoning
+settings, legacy modes where available, filtered
 listing, close/resume without replay, and closing an active turn while retaining
 a usable connection.
+Claude additionally exercises a real form elicitation through both direct and
+relay paths. Deterministic independent wire peers cover extension calls, both
+elicitation scopes and modes, URL completion races, and cancellation. URL tests
+use non-resolving fixture URLs and never perform a real browser/OAuth flow.
 Work occurs in temporary directories.
 Missing tools, credentials, or required interactions fail rather than skip.
 Separate per-agent direct/relay event and stderr transcripts stay under ignored `build/`.
