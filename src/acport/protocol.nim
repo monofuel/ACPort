@@ -38,6 +38,7 @@ type
 
   AuthenticateRequest* = object
     methodId*: string
+    meta*: JsonNode
 
   SessionRequest* = object
     cwd*: string
@@ -126,7 +127,7 @@ type
     optionId*: string
 
 const
-  AcportVersion* = "1.1.0"
+  AcportVersion* = "1.1.1"
   ProtocolVersion* = 1
   SchemaRevision* = "c392d7e9d1de01337b749c0070929933e9f6f09f"
   ParseError* = -32700

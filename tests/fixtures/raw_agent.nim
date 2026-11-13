@@ -20,13 +20,15 @@ proc main() =
   ## Act as a raw JSON-RPC peer without importing ACPort or jsony.
   let initialization = receive()
   let sessionTests = paramCount() > 0 and paramStr(1) == "sessions"
+  let authTests = paramCount() > 0 and paramStr(1) == "auth-meta"
   doAssert initialization["jsonrpc"].getStr() == "2.0"
   doAssert initialization["method"].getStr() == "initialize"
   doAssert initialization["params"]["clientCapabilities"] ==
     %*{"session": {"configOptions": {"boolean": {}}}}
   send(%*{"jsonrpc": "2.0", "id": initialization["id"], "result": {
     "protocolVersion": (if paramCount() > 0 and paramStr(1) == "version-mismatch": 2 else: 1),
-    "agentCapabilities": (if sessionTests: %*{"sessionCapabilities":{"close":{}, "list":{}}} else: newJObject())}})
+    "agentCapabilities": (if sessionTests: %*{"sessionCapabilities":{"close":{}, "list":{}}} else: newJObject()),
+    "authMethods": (if authTests: %*[{"id":"headless", "name":"Headless"}] else: newJArray())}})
   var lateConfig: JsonNode
   proc catalog(value: string): JsonNode =
     ## Build a catalog independently of ACPort's codecs.
@@ -39,7 +41,15 @@ proc main() =
     if not request.hasKey("id"):
       doAssert methodName in ["session/cancel", "$/cancel_request"]
       continue
-    if methodName == "session/new":
+    if methodName == "authenticate":
+      doAssert authTests
+      doAssert request["params"]["methodId"].getStr() == "headless"
+      if request["params"].hasKey("_meta"):
+        doAssert request["params"]["_meta"] == %*{"headless":{"token":"fixture-only", "nested":[true, 7]}}
+      else:
+        doAssert request["params"] == %*{"methodId":"headless"}
+      send(%*{"jsonrpc":"2.0", "id":request["id"], "result":{}})
+    elif methodName == "session/new":
       doAssert request["params"].hasKey("mcpServers")
       var response = %*{"sessionId": "raw-session"}
       if sessionTests: response["configOptions"] = catalog("a")
@@ -76,6 +86,17 @@ proc main() =
         return
       of "invalid-response":
         send(%*{"jsonrpc": "2.0", "id": request["id"], "result": {}, "error": {}})
+      of "rpc-error":
+        send(%*{"jsonrpc":"2.0", "id":request["id"],
+          "error":{"code": -32001, "message":"Fixture error", "data":{"fixture":true}}})
+      of "bad-result":
+        send(%*{"jsonrpc":"2.0", "id":request["id"], "result":{"stopReason":"future"}})
+      of "reply-and-exit":
+        send(%*{"jsonrpc":"2.0", "method":"session/update", "params":{
+          "sessionId":"raw-session", "update":{"sessionUpdate":"agent_message_chunk",
+            "content":{"type":"text", "text":"done"}}}})
+        send(%*{"jsonrpc":"2.0", "id":request["id"], "result":{"stopReason":"end_turn"}})
+        return
       of "permission":
         send(%*{"jsonrpc": "2.0", "id": "peer-permission", "method": "session/request_permission",
           "params": {"sessionId": "raw-session", "toolCall": {"toolCallId": "t"}, "options": []}})

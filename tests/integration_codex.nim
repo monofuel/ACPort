@@ -83,6 +83,19 @@ proc capturedText(state: ptr Capture): string =
   ## Copy shared text into the calling thread's heap.
   withLock state.lock: result = localText(state.text)
 
+proc pollPrompt(session: AcpSession, text: string): PromptResponse =
+  ## Exercise non-consuming readiness against a real streaming Codex completion.
+  var turn = session.startPrompt(@[textBlock(text)])
+  let started = getMonoTime()
+  while not turn.isReady():
+    if (getMonoTime() - started).inMilliseconds >= TestDeadlineMs:
+      session.cancel()
+      discard turn.waitForPrompt(60_000)
+      raise newException(AcpTimeoutError, "Codex did not become ready within the test deadline")
+    sleep(10)
+  doAssert turn.isReady() # Repeated polling must preserve the result.
+  turn.waitForPrompt(5000)
+
 proc runLive(relay: bool) =
   ## Validate real turns, persisted context, permissions, and cancellation.
   let
@@ -112,8 +125,7 @@ proc runLive(relay: bool) =
     let modes = session.getModes().get()
     session.setMode(modes.currentModeId, 60_000)
     doAssert session.getModes().get().currentModeId == modes.currentModeId
-    doAssert session.prompt("Remember this word for our next turn: cobalt. Reply only READY. Do not use tools.",
-      TestDeadlineMs).stopReason == endTurn
+    doAssert session.pollPrompt("Remember this word for our next turn: cobalt. Reply only READY. Do not use tools.").stopReason == endTurn
     doAssert state.capturedText().contains("READY")
     doAssert state.updates > 0
     state.resetCapture()

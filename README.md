@@ -19,7 +19,7 @@ Supports core **ACP v1 over Linux stdio**, with both client and agent/server API
 
 The implementation targets the stable v1 schema at
 [`c392d7e9d1de01337b749c0070929933e9f6f09f`](https://github.com/agentclientprotocol/agent-client-protocol/blob/c392d7e9d1de01337b749c0070929933e9f6f09f/schema/v1/schema.json).
-The package version `1.1.0` and the wire protocol version `1` are separate.
+The package version `1.1.1` and the wire protocol version `1` are separate.
 
 The library uses threads, locks, and condition variables, without asyncdispatch.
 Its only package dependency is [jsony](https://github.com/treeform/jsony), pinned
@@ -92,6 +92,15 @@ var turn = session.startPrompt(@[textBlock("Inspect the project.")])
 let completion = turn.waitForPrompt()
 ```
 
+`turn.isReady()` polls without waiting, cancelling, or consuming the handle. It
+becomes true when `waitForPrompt()` can settle with a response or terminal error,
+including RPC/protocol errors, disconnect without a completion, and client close.
+Readiness for a response includes delivery of preceding update callbacks. If a
+response arrived just before disconnect, those callbacks still finish first.
+`isReady()` reports readiness, not success: consume the handle once with
+`waitForPrompt()` to retrieve its response or raise its error. Poll and consume
+from the handle's owning thread; a consumed or empty handle raises `ValueError`.
+
 Each connection supports multiple sessions, with one active prompt per session.
 `PromptHandle` is a move-only value: consume every handle exactly once, even after
 closing the client. Updates received before a response are delivered before the
@@ -106,6 +115,10 @@ is carried as JSON; applications are responsible for making the actual connectio
 Authentication methods are returned by `initialize`. Existing Codex login state
 can be used by its adapter. `authenticate(methodId)` invokes an advertised
 agent-managed flow; ACPort does not launch interactive terminal authentication.
+`authenticate(methodId, timeoutMs = 0, meta = payload)` optionally forwards an
+opaque JSON payload as `_meta`, for agent-specific headless authentication. The
+agent's `AuthenticateRequest.meta` receives it unchanged. Omitting `meta` keeps
+the existing request shape. Credential interpretation belongs to the agent.
 No browser, login, retry, or reconnect is initiated automatically.
 
 ## Session configuration and lifecycle

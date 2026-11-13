@@ -28,6 +28,9 @@ proc authenticate(context: RequestContext, request: AuthenticateRequest,
     userData: pointer) {.gcsafe.} =
   ## Complete the fixture's explicitly advertised authentication flow.
   let state = cast[ptr State](userData)
+  if request.meta != nil and request.meta.kind != JNull:
+    if request.meta != %*{"headless":{"token":"fixture-only", "nested":[true, 7]}}:
+      raise rpcError(InvalidParams, "Unexpected fixture auth metadata")
   withLock state.lock: state.authenticated = true
 
 proc load(context: RequestContext, request: SessionRequest,

@@ -455,6 +455,14 @@ proc destroyPending(pending: PendingRequest) =
   freeText(pending.response)
   deallocShared(pending)
 
+proc isReady*(pending: PendingRequest): bool =
+  ## Test the waiter's completion conditions under the connection lock.
+  let connection = pending.connection
+  withLock connection.lock:
+    result = connection.closing or
+      (connection.failed and (connection.protocolFailure or pending.response == nil)) or
+      (pending.response != nil and connection.delivered >= pending.barrier)
+
 proc waitResponse*(pending: PendingRequest, timeoutMs = 0,
     context = RequestContext()): JsonNode =
   ## Consume a pending request once, after all preceding update callbacks finish.

@@ -237,8 +237,10 @@ suite "session management":
     var queued = second.startPrompt(@[textBlock("queued")])
     discard first.setConfigOption("enabled", true, 5000)
     second.closeSession(5000)
+    check queued.isReady()
     check queued.waitForPrompt(5000).stopReason == cancelled
     first.closeSession(5000)
+    check running.isReady()
     check running.waitForPrompt(5000).stopReason == cancelled
     let reopened = client.resumeSession(first.id, getTempDir(), timeoutMs = 5000)
     discard reopened.prompt("again", 5000)

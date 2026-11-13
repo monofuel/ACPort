@@ -215,7 +215,8 @@ proc initialize*(client: AcpClient, timeoutMs = 0): InitializeResponse =
   client.connection.setSettings(response)
   client.connection.markInitialized()
 
-proc authenticate*(client: AcpClient, methodId: string, timeoutMs = 0) =
+proc authenticate*(client: AcpClient, methodId: string, timeoutMs = 0,
+    meta: JsonNode = nil) =
   ## Invoke an advertised agent-managed authentication method.
   let connection = client.requireConnection()
   defer: connection.release()
@@ -226,7 +227,9 @@ proc authenticate*(client: AcpClient, methodId: string, timeoutMs = 0) =
       if authMethod.field("id").getStr() == methodId and
           authMethod.field("type").getStr("agent") == "agent": found = true
   if not found: raise newException(AcpProtocolError, "No advertised agent authentication method: " & methodId)
-  discard connection.request("authenticate", %*{"methodId": methodId}, timeoutMs)
+  var params = %*{"methodId": methodId}
+  if meta != nil: params["_meta"] = meta
+  discard connection.request("authenticate", params, timeoutMs)
 
 proc newSession*(client: AcpClient, cwd: string,
     mcpServers: seq[JsonNode] = @[], timeoutMs = 0, meta: JsonNode = nil): AcpSession =
@@ -348,6 +351,11 @@ proc startPrompt*(session: AcpSession, prompt: seq[ContentBlock], meta: JsonNode
     connection.endPrompt(session.id)
     raise
 
+proc isReady*(handle: PromptHandle): bool =
+  ## Poll completion or terminal failure without consuming the handle or waiting.
+  if handle.pending == nil: raise newException(ValueError, "Prompt handle was already consumed")
+  handle.pending.isReady()
+
 proc waitForPrompt*(handle: var PromptHandle, timeoutMs = 0): PromptResponse =
   ## Consume a prompt completion after its earlier updates have been delivered.
   if handle.pending == nil: raise newException(ValueError, "Prompt handle was already consumed")
@@ -412,7 +420,8 @@ proc agentRequest(context: RequestContext, methodName: string,
       if authMethod.field("id").getStr() == id: found = true
     if agent.handlers.onAuthenticate == nil or not found:
       raise rpcError(InvalidParams, "Unsupported authentication method")
-    agent.handlers.onAuthenticate(context, AuthenticateRequest(methodId: id), agent.handlers.userData)
+    agent.handlers.onAuthenticate(context, AuthenticateRequest(methodId: id,
+      meta: params.field("_meta")), agent.handlers.userData)
     result = newJObject()
   of "session/new", "session/load", "session/resume":
     let

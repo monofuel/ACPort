@@ -8,6 +8,7 @@ type
     lock: Lock
     text: SharedText
     updates, decisions, permissionMode: int
+    holdUpdates: bool
   BlockingCall = object
     client: AcpClient
     directory: SharedText
@@ -23,6 +24,11 @@ proc blockedSessionCreation(state: ptr BlockingCall) {.thread.} =
 proc captureUpdate(update: SessionUpdate, userData: pointer) {.gcsafe.} =
   ## Collect updates under a lock so assertions can inspect them safely.
   let capture = cast[ptr Capture](userData)
+  while true:
+    var hold: bool
+    withLock capture.lock: hold = capture.holdUpdates
+    if not hold: break
+    sleep(5)
   withLock capture.lock:
     inc capture.updates
     if update.kind in {agentMessageChunk, userMessageChunk}:
@@ -73,6 +79,113 @@ proc rawSend(process: Process, value: JsonNode) =
 proc rawRead(process: Process): JsonNode =
   ## Read a fixture response with the standard library alone.
   parseJson(process.outputStream.readLine())
+
+proc awaitReady(handle: PromptHandle): bool =
+  ## Bound polling without consuming or copying the move-only handle.
+  for attempt in 0 ..< 1000:
+    if handle.isReady(): return true
+    sleep(5)
+
+suite "prompt readiness and headless authentication":
+  test "polling preserves the handle through active work and successful completion":
+    let directory = createTempDir("acport-ready-", "")
+    defer: removeDir(directory)
+    let capture = newCapture()
+    defer: freeCapture(capture)
+    let client = connectFixture(capture)
+    defer: client.close()
+    let session = client.newSession(directory, timeoutMs = 5000)
+    var turn = session.startPrompt(@[textBlock("slow")])
+    check not turn.isReady()
+    check not turn.isReady()
+    session.cancel()
+    check turn.awaitReady()
+    check turn.isReady()
+    check turn.waitForPrompt(5000).stopReason == cancelled
+    expect ValueError: discard turn.isReady()
+    var normal = session.startPrompt(@[textBlock("done")])
+    check normal.awaitReady()
+    check normal.waitForPrompt(5000).stopReason == endTurn
+
+  test "completion is ready only after earlier callbacks have returned":
+    for disconnect in [false, true]:
+      let directory = createTempDir("acport-ready-", "")
+      defer: removeDir(directory)
+      let capture = newCapture()
+      defer: freeCapture(capture)
+      capture.holdUpdates = true
+      let client = newAcpClient("ready", "1", ClientHandlers(onUpdate: captureUpdate, userData: capture))
+      defer: client.close()
+      defer:
+        withLock capture.lock: capture.holdUpdates = false
+      client.connect(absolutePath(if disconnect: "build/raw-agent" else: "build/fixture-agent"))
+      discard client.initialize(5000)
+      let session = client.newSession(directory, timeoutMs = 5000)
+      var turn = session.startPrompt(@[textBlock(if disconnect: "reply-and-exit" else: "done")])
+      for attempt in 0 ..< 1000:
+        if not session.isPromptActive(): break
+        sleep(5)
+      check not session.isPromptActive() # The reader has received the response.
+      if disconnect:
+        expect AcpTransportError: discard client.newSession(directory, timeoutMs = 5000)
+      check not turn.isReady() # Earlier callbacks still own the completion barrier.
+      withLock capture.lock: capture.holdUpdates = false
+      check turn.awaitReady()
+      check turn.waitForPrompt(5000).stopReason == endTurn
+
+  test "RPC errors, malformed replies and disconnects become ready without consumption":
+    for mode in ["rpc-error", "bad-result", "invalid-response", "die"]:
+      let client = newAcpClient("ready", "1")
+      defer: client.close()
+      client.connect(absolutePath("build/raw-agent"))
+      discard client.initialize(5000)
+      let session = client.newSession(getTempDir(), timeoutMs = 5000)
+      var turn = session.startPrompt(@[textBlock(mode)])
+      check turn.awaitReady()
+      check turn.isReady()
+      case mode
+      of "rpc-error":
+        try:
+          discard turn.waitForPrompt(5000)
+          check false
+        except AcpRpcError as error:
+          check error.code == -32001
+          check error.data == %*{"fixture":true}
+      of "die":
+        expect AcpTransportError: discard turn.waitForPrompt(5000)
+      else:
+        expect AcpProtocolError: discard turn.waitForPrompt(5000)
+
+  test "pending handles remain pollable after their client has closed":
+    let directory = createTempDir("acport-ready-", "")
+    defer: removeDir(directory)
+    let capture = newCapture()
+    defer: freeCapture(capture)
+    let client = connectFixture(capture)
+    let session = client.newSession(directory, timeoutMs = 5000)
+    var turn = session.startPrompt(@[textBlock("slow")])
+    client.close()
+    check turn.isReady()
+    check turn.isReady()
+    expect AcpTransportError: discard turn.waitForPrompt(5000)
+    expect ValueError: discard turn.isReady()
+
+  test "optional authentication metadata reaches both raw peers and typed agent handlers":
+    let metadata = %*{"headless":{"token":"fixture-only", "nested":[true, 7]}}
+    block:
+      let client = newAcpClient("auth", "1")
+      defer: client.close()
+      client.connect(absolutePath("build/raw-agent"), @["auth-meta"])
+      discard client.initialize(5000)
+      client.authenticate("headless", 5000)
+      client.authenticate("headless", 5000, meta = metadata)
+    block:
+      let client = newAcpClient("auth", "1")
+      defer: client.close()
+      client.connect(absolutePath("build/fixture-agent"), @["auth"])
+      discard client.initialize(5000)
+      expect AcpRpcError: client.authenticate("fixture-key", 5000, meta = %*{"wrong":true})
+      client.authenticate("fixture-key", 5000, meta = metadata)
 
 suite "threaded stdio":
   test "close wakes a blocked session-creation call on another thread":
