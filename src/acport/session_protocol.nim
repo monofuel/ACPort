@@ -40,6 +40,7 @@ type
 
   SessionInfo* = object
     sessionId*, cwd*: string
+    additionalDirectories*: seq[string]
     title*, updatedAt*: Option[string]
     meta*, raw*: JsonNode
   ListSessionsRequest* = object
@@ -59,6 +60,10 @@ type
   CloseSessionRequest* = object
     sessionId*: string
     meta*: JsonNode
+  DeleteSessionRequest* = object
+    sessionId*: string
+    meta*, raw*: JsonNode
+  DeleteSessionResponse* = EmptyMessage
   SessionInfoUpdate* = object
     titlePresent*, updatedAtPresent*: bool
     title*, updatedAt*: Option[string]
@@ -248,6 +253,7 @@ proc toJsonNode*(modes: SessionModeState): JsonNode =
 proc parseSessionInfo*(node: JsonNode): SessionInfo =
   ## Decode a stored session descriptor without activating that session.
   SessionInfo(sessionId: node.requiredString("sessionId"), cwd: node.requiredString("cwd"),
+    additionalDirectories: parseDirectories(node.field("additionalDirectories")),
     title: optionalString(node, "title"), updatedAt: optionalString(node, "updatedAt"),
     meta: node.field("_meta"), raw: node)
 
@@ -255,6 +261,7 @@ proc toJsonNode*(info: SessionInfo): JsonNode =
   ## Encode a session descriptor with optional title and timestamp.
   if info.raw != nil: return info.raw
   result = %*{"sessionId": info.sessionId, "cwd": info.cwd}
+  if info.additionalDirectories.len > 0: result["additionalDirectories"] = %info.additionalDirectories
   result.addOptional("title", info.title)
   result.addOptional("updatedAt", info.updatedAt)
   result.addMeta(info.meta)
@@ -295,6 +302,16 @@ proc parseSetMode*(node: JsonNode): SetModeRequest =
 proc parseCloseSession*(node: JsonNode): CloseSessionRequest =
   ## Decode a close request without confusing it with history deletion.
   CloseSessionRequest(sessionId: node.requiredString("sessionId"), meta: node.field("_meta"))
+
+proc parseDeleteSessionRequest*(node: JsonNode): DeleteSessionRequest =
+  ## Decode history deletion independently of active-session closure.
+  DeleteSessionRequest(sessionId: node.requiredString("sessionId"), meta: node.field("_meta"), raw: node)
+
+proc toJsonNode*(request: DeleteSessionRequest): JsonNode =
+  ## Encode deletion of a stored session identifier.
+  if request.raw != nil: return request.raw
+  result = %*{"sessionId": request.sessionId}
+  result.addMeta(request.meta)
 
 proc parseConfigOptionUpdate*(update: SessionUpdate): Option[seq[SessionConfigOption]] =
   ## Decode configuration updates while keeping the 1.0 UpdateKind enum unchanged.

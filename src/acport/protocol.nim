@@ -1,5 +1,5 @@
 import
-  std/[json, options],
+  std/[json, options, os, strutils],
   jsony
 
 type
@@ -16,6 +16,7 @@ type
     name*: string
     version*: string
     title*: Option[string]
+    meta*, raw*: JsonNode
 
   PromptCapabilities* = object
     image*, audio*, embeddedContext*: bool
@@ -40,12 +41,6 @@ type
     methodId*: string
     meta*: JsonNode
 
-  SessionRequest* = object
-    cwd*: string
-    mcpServers*: seq[JsonNode]
-    sessionId*: string
-    meta*: JsonNode
-
   SessionResponse* = object
     sessionId*: string
     modes*, configOptions*, meta*: JsonNode
@@ -58,6 +53,22 @@ type
     kind*: ContentKind
     text*, uri*, name*, data*, mimeType*: string
     resource*, annotations*, meta*, raw*: JsonNode
+
+  SystemPrompt* = object
+    mode*: string
+    content*: seq[ContentBlock]
+    meta*, raw*: JsonNode
+
+  SessionRequest* = object
+    cwd*: string
+    mcpServers*: seq[JsonNode]
+    sessionId*: string
+    additionalDirectories*: seq[string]
+    systemPrompt*: Option[SystemPrompt]
+    meta*, raw*: JsonNode
+
+  EmptyMessage* = object
+    meta*, raw*: JsonNode
 
   PromptRequest* = object
     sessionId*: string
@@ -75,6 +86,7 @@ type
     path*: string
     oldText*: Option[string]
     newText*: string
+    meta*, raw*: JsonNode
 
   ToolContentKind* = enum
     blockToolContent, diffToolContent, terminalToolContent, unknownToolContent
@@ -84,11 +96,12 @@ type
     content*: ContentBlock
     diff*: FileDiff
     terminalId*: string
-    raw*: JsonNode
+    meta*, raw*: JsonNode
 
   ToolLocation* = object
     path*: string
     line*: Option[int]
+    meta*, raw*: JsonNode
 
   ToolCall* = object
     toolCallId*, title*, name*, kind*, status*: string
@@ -98,6 +111,7 @@ type
 
   PlanEntry* = object
     content*, priority*, status*: string
+    meta*, raw*: JsonNode
 
   UpdateKind* = enum
     userMessageChunk, agentMessageChunk, agentThoughtChunk, toolCall,
@@ -125,9 +139,10 @@ type
   PermissionOutcome* = object
     outcome*: string
     optionId*: string
+    meta*, outcomeMeta*, raw*: JsonNode
 
 const
-  AcportVersion* = "1.2.0"
+  AcportVersion* = "1.3.0"
   ProtocolVersion* = 1
   SchemaRevision* = "c392d7e9d1de01337b749c0070929933e9f6f09f"
   ParseError* = -32700
@@ -161,6 +176,21 @@ proc requiredString*(node: JsonNode, key: string): string =
     raise rpcError(InvalidParams, "Expected string: " & key)
   value.getStr()
 
+proc optionalUnsigned*(node: JsonNode, key: string, maximum = high(uint64)): Option[uint64] =
+  ## Decode a nullable unsigned integer, including JSON values above int64's maximum.
+  let value = node.field(key)
+  if value.kind == JNull: return
+  if value.kind notin {JInt, JString}: raise rpcError(InvalidParams, "Expected unsigned integer: " & key)
+  # std/json represents large unsigned integers as unquoted JString values.
+  let spelling = $value
+  for digit in spelling:
+    if digit notin {'0'..'9'}: raise rpcError(InvalidParams, "Expected unsigned integer: " & key)
+  var number: BiggestUInt
+  try: number = parseBiggestUInt(spelling)
+  except ValueError: raise rpcError(InvalidParams, "Expected unsigned integer: " & key)
+  if number > maximum: raise rpcError(InvalidParams, "Unsigned integer out of range: " & key)
+  result = some(uint64(number))
+
 proc typedJson*[T](value: T): JsonNode =
   ## Encode a plain protocol record using jsony.
   parseJson(value.toJson())
@@ -176,6 +206,26 @@ proc addMeta(node: JsonNode, meta: JsonNode) =
   ## Attach metadata only when it was provided.
   if meta != nil and meta.kind != JNull:
     node["_meta"] = meta
+
+proc parseEmptyMessage*(node: JsonNode): EmptyMessage =
+  ## Decode an extensible empty request or response envelope.
+  node.requireObject()
+  EmptyMessage(meta: node.field("_meta"), raw: node)
+
+proc toJsonNode*(message: EmptyMessage): JsonNode =
+  ## Encode an empty envelope without losing received extensions.
+  if message.raw != nil: return message.raw
+  result = newJObject()
+  result.addMeta(message.meta)
+
+proc parseDirectories*(node: JsonNode): seq[string] =
+  ## Decode an ordered additional-root list and reject nonabsolute paths.
+  if node == nil or node.kind == JNull: return
+  if node.kind != JArray: raise rpcError(InvalidParams, "Expected additionalDirectories array")
+  for path in node:
+    if path.kind != JString or not path.getStr().isAbsolute():
+      raise rpcError(InvalidParams, "Additional directories must be absolute")
+    result.add(path.getStr())
 
 proc textBlock*(text: string): ContentBlock =
   ## Construct a text content block.
@@ -242,21 +292,46 @@ proc parsePrompt*(node: JsonNode): PromptRequest =
   for content in blocks:
     result.prompt.add(parseContent(content))
 
-proc parseSessionRequest*(node: JsonNode, load = false): SessionRequest =
+proc toJsonNode*(prompt: SystemPrompt): JsonNode =
+  ## Encode explicit system instructions, retaining a received representation.
+  if prompt.raw != nil: return prompt.raw
+  result = %*{"mode": prompt.mode, "content": newJArray()}
+  for content in prompt.content: result["content"].add(content.toJsonNode())
+  result.addMeta(prompt.meta)
+
+proc parseSystemPrompt*(node: JsonNode): SystemPrompt =
+  ## Decode system instructions; capability and mode checks precede session dispatch.
+  result = SystemPrompt(mode: node.requiredString("mode"), meta: node.field("_meta"), raw: node)
+  let content = node.field("content")
+  if content.kind != JArray or content.len == 0:
+    raise rpcError(InvalidParams, "System prompt content must be nonempty")
+  for contentBlock in content:
+    let parsed = parseContent(contentBlock)
+    if parsed.kind != textContent: raise rpcError(InvalidParams, "System prompts support text only")
+    result.content.add(parsed)
+
+proc parseSessionRequest*(node: JsonNode, load = false, resume = false): SessionRequest =
   ## Decode session setup without executing or interpreting MCP configuration.
   result.cwd = node.requiredString("cwd")
   result.meta = node.field("_meta")
+  result.raw = node
+  result.additionalDirectories = parseDirectories(node.field("additionalDirectories"))
+  if node.field("systemPrompt").kind != JNull:
+    result.systemPrompt = some(parseSystemPrompt(node["systemPrompt"]))
   let servers = node.field("mcpServers")
-  if servers.kind != JArray:
+  if servers.kind != JArray and not (resume and servers.kind == JNull):
     raise rpcError(InvalidParams, "Expected mcpServers array")
-  for server in servers:
-    result.mcpServers.add(server)
+  if servers.kind == JArray:
+    for server in servers: result.mcpServers.add(server)
   if load:
     result.sessionId = node.requiredString("sessionId")
 
 proc toJsonNode*(request: SessionRequest, load = false): JsonNode =
   ## Encode new or load session parameters.
   result = %*{"cwd": request.cwd, "mcpServers": request.mcpServers}
+  if request.raw != nil: result = request.raw.copy()
+  if request.additionalDirectories.len > 0: result["additionalDirectories"] = %request.additionalDirectories
+  if request.systemPrompt.isSome: result["systemPrompt"] = request.systemPrompt.get().toJsonNode()
   result.addMeta(request.meta)
   if load:
     result["sessionId"] = %request.sessionId
@@ -313,6 +388,7 @@ proc parseToolContent*(node: JsonNode): ToolContent =
   ## Decode rich tool content, text diffs, and terminal references.
   node.requireObject()
   result.raw = node
+  result.meta = node.field("_meta")
   case node.requiredString("type")
   of "content":
     result.kind = blockToolContent
@@ -321,6 +397,8 @@ proc parseToolContent*(node: JsonNode): ToolContent =
     result.kind = diffToolContent
     result.diff.path = node.requiredString("path")
     result.diff.newText = node.requiredString("newText")
+    result.diff.meta = node.field("_meta")
+    result.diff.raw = node
     let oldText = node.field("oldText")
     if oldText.kind == JString: result.diff.oldText = some(oldText.getStr())
     elif oldText.kind != JNull: raise rpcError(InvalidParams, "Expected oldText string or null")
@@ -340,10 +418,12 @@ proc toJsonNode*(content: ToolContent): JsonNode =
     result = %*{"type": "diff", "path": content.diff.path,
       "oldText": (if content.diff.oldText.isSome: %content.diff.oldText.get() else: newJNull()),
       "newText": content.diff.newText}
+    result.addMeta(content.diff.meta)
   of terminalToolContent:
     result = %*{"type": "terminal", "terminalId": content.terminalId}
   of unknownToolContent:
     raise rpcError(InvalidParams, "Unknown tool content requires a raw payload")
+  result.addMeta(content.meta)
 
 proc parseToolCall*(node: JsonNode): ToolCall =
   ## Decode tool reporting, retaining patch fields and rich content verbatim.
@@ -365,8 +445,11 @@ proc parseToolCall*(node: JsonNode): ToolCall =
   if locations.kind == JArray:
     var items: seq[ToolLocation]
     for item in locations:
-      discard item.requiredString("path")
-      items.add(decodeRecord(item, ToolLocation))
+      let line = item.field("line")
+      var location = ToolLocation(path: item.requiredString("path"), meta: item.field("_meta"), raw: item)
+      if line.kind == JInt and line.getBiggestInt() >= 0 and line.getBiggestInt() <= int64(high(uint32)):
+        location.line = some(line.getInt())
+      items.add(location)
     result.locations = some(items)
   elif locations.kind != JNull: raise rpcError(InvalidParams, "Expected tool locations array")
 
@@ -380,7 +463,15 @@ proc toJsonNode*(tool: ToolCall): JsonNode =
   if tool.content.isSome:
     result["content"] = newJArray()
     for content in tool.content.get(): result["content"].add(content.toJsonNode())
-  if tool.locations.isSome: result["locations"] = typedJson(tool.locations.get())
+  if tool.locations.isSome:
+    result["locations"] = newJArray()
+    for location in tool.locations.get():
+      var node = location.raw
+      if node == nil:
+        node = %*{"path": location.path}
+        if location.line.isSome: node["line"] = %location.line.get()
+        node.addMeta(location.meta)
+      result["locations"].add(node)
   for (key, value) in [("rawInput", tool.rawInput), ("rawOutput", tool.rawOutput)]:
     if value != nil: result[key] = value
   result.addMeta(tool.meta)
@@ -408,7 +499,10 @@ proc parseUpdate*(params: JsonNode): SessionUpdate =
     result.kind = planUpdate
     let entries = update.field("entries")
     if entries.kind != JArray: raise rpcError(InvalidParams, "Expected plan entries")
-    for entry in entries: result.entries.add(decodeRecord(entry, PlanEntry))
+    for entry in entries:
+      result.entries.add(PlanEntry(content: entry.requiredString("content"),
+        priority: entry.requiredString("priority"), status: entry.requiredString("status"),
+        meta: entry.field("_meta"), raw: entry))
   else:
     result.kind = unknownUpdate
 
@@ -428,7 +522,13 @@ proc toJsonNode*(update: SessionUpdate): JsonNode =
       payload = update.tool.toJsonNode()
       payload["sessionUpdate"] = %(if update.kind == toolCall: "tool_call" else: "tool_call_update")
     of planUpdate:
-      payload = %*{"sessionUpdate": "plan", "entries": typedJson(update.entries)}
+      payload = %*{"sessionUpdate": "plan", "entries": newJArray()}
+      for entry in update.entries:
+        var node = entry.raw
+        if node == nil:
+          node = %*{"content": entry.content, "priority": entry.priority, "status": entry.status}
+          node.addMeta(entry.meta)
+        payload["entries"].add(node)
     of unknownUpdate:
       raise rpcError(InvalidParams, "Unknown update requires a raw payload")
     payload.addMeta(update.meta)
@@ -464,12 +564,18 @@ proc toJsonNode*(request: PermissionRequest): JsonNode =
 
 proc toJsonNode*(outcome: PermissionOutcome): JsonNode =
   ## Encode the selected option or the protocol's cancelled outcome.
+  if outcome.raw != nil: return outcome.raw
   result = %*{"outcome": {"outcome": outcome.outcome}}
   if outcome.outcome == "selected": result["outcome"]["optionId"] = %outcome.optionId
+  result.addMeta(outcome.meta)
+  result["outcome"].addMeta(outcome.outcomeMeta)
 
 proc parsePermissionOutcome*(node: JsonNode): PermissionOutcome =
   ## Decode a permission response without treating rejection as an RPC failure.
   let outcome = node.field("outcome")
+  result.raw = node
+  result.meta = node.field("_meta")
+  result.outcomeMeta = outcome.field("_meta")
   if outcome.field("outcome").kind != JString:
     raise newException(AcpProtocolError, "Missing permission outcome")
   result.outcome = outcome["outcome"].getStr()

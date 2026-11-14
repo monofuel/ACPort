@@ -304,11 +304,14 @@ proc applyUpdateLocked(connection: Connection, params: JsonNode) =
     update = params.field("update")
     kind = update.field("sessionUpdate").getStr()
   if kind notin ["config_option_update", "current_mode_update", "session_info_update",
-      "available_commands_update", "usage_update"]: return
+      "available_commands_update", "usage_update", "compaction_update", "compaction_summary_chunk"]: return
   let
     session = connection.sessionLocked(id, true)
     snapshot = session.snapshotLocked()
   case kind
+  of "compaction_update", "compaction_summary_chunk":
+    if snapshot.field("compactions").kind != JArray: snapshot["compactions"] = newJArray()
+    applyCompaction(snapshot["compactions"], update)
   of "available_commands_update":
     discard parseAvailableCommands(update.field("availableCommands"))
     snapshot["availableCommands"] = update["availableCommands"]
@@ -361,6 +364,8 @@ proc applyResponseLocked(connection: Connection, methodName: string, params,
     if snapshot.field("info").kind != JObject: snapshot["info"] = newJObject()
     snapshot["info"]["sessionId"] = %id
     snapshot["info"]["cwd"] = params.field("cwd")
+    let directories = params.field("additionalDirectories")
+    snapshot["info"]["additionalDirectories"] = if directories.kind == JArray: directories else: newJArray()
     session.closed = false
     session.closing = false
   elif methodName == "session/set_config_option":
@@ -830,7 +835,8 @@ proc handleLine(connection: Connection, line: string) =
         let session = connection.sessionLocked(params.field("sessionId").getStr())
         if session != nil: task.modeRevision = session.modeRevision
         if methodName in ["session/new", "session/load", "session/resume", "session/list",
-            "session/close", "session/set_mode", "session/set_config_option"]:
+            "session/close", "session/delete", "logout", "session/set_mode", "session/set_config_option",
+            "terminal/output", "terminal/kill", "terminal/release"]:
           if connection.managementTail == nil: connection.managementHead = task
           else: connection.managementTail.next = task
           connection.managementTail = task

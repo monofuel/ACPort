@@ -1,4 +1,4 @@
-.PHONY: setup check test test-arc test-orc integration-setup integration-test integration-test-codex integration-test-grok integration-test-claude examples build/fixture-agent build/raw-agent build/session-agent build/features-agent build/features-raw
+.PHONY: setup check test test-arc test-orc integration-setup integration-test integration-test-codex integration-test-grok integration-test-claude examples build/fixture-agent build/raw-agent build/session-agent build/features-agent build/features-raw build/coverage-agent build/coverage-raw
 
 NIM ?= nim
 
@@ -28,11 +28,20 @@ build/features-raw: tests/fixtures/features_raw.nim
 	mkdir -p build
 	$(NIM) c --out:$@ $<
 
-test: build/fixture-agent build/raw-agent build/session-agent build/features-agent build/features-raw
+build/coverage-agent: tests/fixtures/coverage_agent.nim src/acport.nim src/acport/*.nim
+	mkdir -p build
+	$(NIM) c --out:$@ $<
+
+build/coverage-raw: tests/fixtures/coverage_raw.nim
+	mkdir -p build
+	$(NIM) c --out:$@ $<
+
+test: build/fixture-agent build/raw-agent build/session-agent build/features-agent build/features-raw build/coverage-agent build/coverage-raw build/agent-relay
 	$(NIM) r --out:build/test_protocol tests/test_protocol.nim
 	$(NIM) r --out:build/test_stdio tests/test_stdio.nim
 	$(NIM) r --out:build/test_sessions tests/test_sessions.nim
 	$(NIM) r --out:build/test_features tests/test_features.nim
+	$(NIM) r --out:build/test_coverage tests/test_coverage.nim
 
 test-arc:
 	ACPORT_TEST_MM=arc $(MAKE) test

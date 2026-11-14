@@ -3,11 +3,11 @@
 A threaded Nim library for [Agent Client Protocol](https://agentclientprotocol.com/)
 clients and agents. A sibling to [MCPort](https://github.com/monofuel/MCPort).
 
-## ACPort 1.2
+## ACPort 1.3
 
 Supports core **ACP v1 over Linux stdio**, with both client and agent/server APIs:
 
-- Version and capability negotiation, plus agent-managed authentication.
+- Version and capability negotiation, agent-managed authentication, logout, and host-managed terminal login.
 - New sessions, multiple turns, concurrent sessions, and `session/load` with history replay.
 - Configuration catalogs with flat/grouped selects, negotiated booleans, and live updates.
 - Explicit legacy session modes, alongside `session/set_config_option`.
@@ -19,20 +19,24 @@ Supports core **ACP v1 over Linux stdio**, with both client and agent/server API
 - Bidirectional custom request/notification hooks and extension capability metadata.
 - Typed command catalogs and absolute usage/cost snapshots.
 - Opt-in form and URL elicitation, with cancellation and correlated URL completion.
+- Callback-backed filesystem reads/writes and the complete terminal request family.
+- Session history deletion, additional workspace roots, and negotiated system prompts.
+- Explicit agent declarations for rich prompts and MCP HTTP/SSE configurations.
+- Opt-in live notices and ordered, streamed compaction snapshots.
 
 The implementation targets the stable v1 schema at
 [`c392d7e9d1de01337b749c0070929933e9f6f09f`](https://github.com/agentclientprotocol/agent-client-protocol/blob/c392d7e9d1de01337b749c0070929933e9f6f09f/schema/v1/schema.json).
-The package version `1.2.0` and the wire protocol version `1` are separate.
+The package version `1.3.0` and the wire protocol version `1` are separate.
 
 The library uses threads, locks, and condition variables, without asyncdispatch.
 Its only package dependency is [jsony](https://github.com/treeform/jsony), pinned
 in `nimby.lock`. HTTP libraries and MCPort are not required.
 
-HTTP/WebSocket transport, ACP v2, client filesystem and terminal execution,
-persisted session deletion, and vendor-specific implementations are outside 1.2.
-Unknown update variants remain available as raw JSON.
-Client filesystem, terminal, and other unsupported capabilities are not advertised.
-An agent advertises lifecycle capabilities only when the corresponding handlers exist.
+HTTP/WebSocket transport, ACP v2, and vendor-specific implementations remain outside 1.x.
+Applications supply filesystem access, terminal execution, authentication UI, and
+session persistence through callbacks. Capabilities follow installed handlers or
+explicit application declarations. See [COVERAGE.md](COVERAGE.md) for the pinned
+v1 method matrix, field coverage, and verification boundaries.
 
 ## Development
 
@@ -117,12 +121,29 @@ is carried as JSON; applications are responsible for making the actual connectio
 
 Authentication methods are returned by `initialize`. Existing Codex login state
 can be used by its adapter. `authenticate(methodId)` invokes an advertised
-agent-managed flow; ACPort does not launch interactive terminal authentication.
+agent-managed flow.
 `authenticate(methodId, timeoutMs = 0, meta = payload)` optionally forwards an
 opaque JSON payload as `_meta`, for agent-specific headless authentication. The
 agent's `AuthenticateRequest.meta` receives it unchanged. Omitting `meta` keeps
 the existing request shape. Credential interpretation belongs to the agent.
-No browser, login, retry, or reconnect is initiated automatically.
+Install `onTerminalAuth` to advertise terminal authentication, then explicitly call
+`client.authenticateTerminal(methodId)`. On the owning thread, the callback receives
+`TerminalAuthInvocation`: the configured executable, base arguments followed by
+the descriptor's arguments, cwd, merged environment, and the original descriptor.
+The descriptor cannot choose another executable. The host presents the invocation
+and environment changes for consent and runs the interactive process in its own
+terminal. No shell interpolation or terminal UI is supplied by ACPort.
+
+Return `TerminalExitStatus(exitCode: some(0'u32))` after successful login. ACPort then
+restarts the original stdio invocation and repeats initialization with the saved
+options, returning `InitializeResponse`. A nonzero exit, signal, missing exit code,
+or callback exception leaves the existing connection intact. Raise
+`AcpCancelledError` for interactive cancellation. The callback owns its interactive
+deadline; the helper's `timeoutMs` covers reinitialization. A restart/initialize
+failure leaves the client disconnected and propagates its error. Reconnect explicitly
+to recover. Previous session handles reject further operations; explicitly load or
+resume to obtain new handles. Pending prompt handles remain collectible.
+Stop other callers before terminal authentication, just as for connect and close.
 
 ## Session configuration and lifecycle
 
@@ -163,7 +184,29 @@ peer's advertised capabilities before sending requests.
 resources while keeping the connection and saved history. Repeated closure is
 harmless. Copies of a closed session reject new prompts until an explicit load
 or resume reopens it. A close deadline leaves the session locally closing; retry
-close or explicitly load/resume to recover. ACPort never deletes persisted history.
+close or explicitly load/resume to recover.
+
+`client.deleteSession(id)` asks the agent to remove stored history from listing;
+an already-absent ID succeeds. `client.logout()` asks it to clear authentication.
+Both return an extensible empty response and accept `_meta`. Active-session and
+retention behavior belong to the agent; neither helper implicitly closes sessions.
+Agents opt in with `onDeleteSession` and `onLogout`. Authentication gates after
+logout must be enforced by application handlers.
+
+New/load/resume accept trailing `additionalDirectories` and `systemPrompt` options.
+Directory lists contain absolute paths in order and replace the complete prior
+list; omission or an empty list means no additional roots. `getSessionInfo()` and
+listed `SessionInfo` values expose the current additional roots. System prompts use
+`some(SystemPrompt(mode: "append", content: @[textBlock("instructions")]))`.
+Only nonempty text content is allowed. An omitted system prompt lets the agent
+restore saved instructions or its defaults; ACPort does not silently resend one.
+
+Declare support using `AgentOptions(additionalDirectories: true, systemPrompt: true)`.
+Append is the baseline; `systemPromptOverride: true` additionally enables override
+and requires `systemPrompt: true`. Unsupported modes or content fail before the
+session handler runs. Agent options also expose `promptCapabilities` and
+`mcpCapabilities` (`http`/`sse`); handlers must implement what they declare. MCP
+configurations remain JSON passed to those handlers, without new MCP dependencies.
 
 ## Agent/server
 
@@ -190,6 +233,34 @@ reason. A request context provides:
 
 Agents supply their own tools, MCP connections, LLM integration, authentication
 policy, and persistence. ACPort does not automatically execute reported tool calls.
+
+## Host filesystem and terminals
+
+Install `onReadTextFile` and/or `onWriteTextFile` in `ClientHandlers` to advertise
+those operations independently. Callbacks receive typed requests and return typed
+responses, retaining `_meta` and raw extensions. Reads may use unsaved editor
+buffers. Optional `line` is one-based and `limit` counts lines. ACPort checks
+absolute paths and wire types; applications enforce permissions and file access.
+
+Terminal support requires all five callbacks: `onCreateTerminal`,
+`onTerminalOutput`, `onWaitForTerminalExit`, `onKillTerminal`, and
+`onReleaseTerminal`. A partial bundle raises `ValueError`. Applications own terminal
+IDs, session isolation, subprocesses, retained output, and resource cleanup:
+
+- Create starts the structured command and returns its ID without waiting for exit.
+- Output returns a nonconsuming, nonblocking snapshot and optional exit status.
+- Honor `outputByteLimit` by discarding oldest bytes at a UTF-8 character boundary.
+- Wait cooperates with cancellation; cancelling a wait leaves the process running.
+- Kill stops the process while preserving its ID and output. Release stops it if
+  necessary and invalidates its ID; already displayed embedded output may remain.
+
+Agent contexts provide `readTextFile`, `writeTextFile`, `createTerminal`,
+`terminalOutput`, `waitForTerminalExit`, `killTerminal`, and `releaseTerminal`.
+They check peer capabilities and retain normal RPC errors, deadlines, and parent
+cancellation. Agents must release created terminals. Host callbacks must honor
+`context.isCancelled()` and arrange per-session cleanup in the owning application.
+After client close joins callbacks, the host must reap any remaining children and
+release its storage. ACPort does not supply a production filesystem or PTY backend.
 
 ## Extensions and typed event state
 
@@ -225,6 +296,21 @@ Both getters return owned snapshots updated in wire order before callbacks.
 events, and `availableCommandsUpdate` / `usageUpdate` construct notifications for
 agent handlers. The existing `UpdateKind` enum and initial `session.state`
 snapshot remain source compatible.
+
+Set `ClientOptions(notices: true, compaction: true)` in `newAcpClient` to opt into
+those events. `parseNoticeUpdate` reads transient user-facing notices; ACPort does
+not add them to history. `noticeUpdate` constructs one for an agent handler.
+
+`parseCompactionUpdate` and `parseCompactionSummaryChunk` decode compaction events;
+`compactionUpdate` and `compactionSummaryChunk` construct them. A first-seen ID fixes
+its position. Summary chunks append in wire order, creating an `in_progress`
+entity when necessary. Later updates patch the same entity. For `summary`, `error`,
+and `_meta`, omission retains the stored value, null clears it, and a supplied
+value replaces it; an empty summary array also clears it. Set the corresponding
+`summaryPresent`, `errorPresent`, or `metaPresent` flag when constructing a patch.
+`getCompactions()` returns owned assembled snapshots updated before callbacks.
+Unknown status/severity strings and raw fields remain available. `sendUpdate`
+rejects these events when the client did not negotiate support.
 
 ## Elicitation
 
@@ -294,15 +380,18 @@ leaving the caller waiting indefinitely.
 
 ## Threading and ownership
 
-Client calls after connection setup are thread-safe. Connect, initialize, and
-close from the owning thread. Stop new callers before closing; already-started
+Client calls after connection setup are thread-safe. Connect, initialize,
+authenticateTerminal, and close from the owning thread. Stop new callers before closing; already-started
 request handles may be collected after close. After `close`, the client pointer
 is freed and must not be used or closed again. Release an agent only after
 `runStdioAgent` returns.
 
 Prompt and permission handlers run on a worker pool. Session setup, lifecycle and
 configuration handlers run on a separate serial management thread, so a full
-prompt pool cannot starve them. Protect application state accessed from both.
+prompt pool cannot starve them. Terminal output, kill, and release also use the
+management worker, independently of blocked terminal exit waits on ordinary
+workers. Keep these control callbacks nonblocking or promptly bounded. Protect
+application state accessed from both threads.
 Update, extension-notification, elicitation-completion, and diagnostic callbacks run on one
 ordered callback thread per connection. The reader and writer never invoke
 application callbacks. Callbacks must return promptly and cannot make blocking
