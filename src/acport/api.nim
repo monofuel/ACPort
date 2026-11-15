@@ -7,6 +7,9 @@ export RequestContext, LogHandler, getRequestId, isCancelled
 type
   ClientOptions* = object
     notices*, compaction*: bool
+    ## Zero limits retain existing behavior. Bounded update/log callbacks must
+    ## consume delivery without making synchronous protocol requests.
+    maxMessageBytes*, maxQueuedBytes*: int
   McpCapabilities* = object
     http*, sse*: bool
   AgentOptions* = object
@@ -451,7 +454,8 @@ proc connect*(client: AcpClient, command: string, args: seq[string] = @[],
   try:
     client.connection = newConnection(client.process.outputFd,
       client.process.inputFd, clientRequest, clientNotification,
-      client, client.process.errorFd, clientLog, workerThreads)
+      client, client.process.errorFd, clientLog, workerThreads,
+      client.options.maxMessageBytes, client.options.maxQueuedBytes)
   except CatchableError:
     client.process.close()
     raise

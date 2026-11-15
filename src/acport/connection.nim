@@ -85,6 +85,7 @@ type
     managementHead, managementTail: Task
     eventHead, eventTail: Event
     queued, delivered: uint64
+    maxMessageBytes, maxQueuedBytes, queuedBytes: int
     callbackThreadId: int
     requestHandler: RequestHandler
     notificationHandler: NotificationHandler
@@ -164,6 +165,16 @@ proc cancelRpcLocked(connection: Connection, id: string, incoming: bool) =
 
 proc queueEventLocked(connection: Connection, methodName, params: string) =
   ## Append an ordered callback event while holding the state lock.
+  ## Bounded delivery requires callbacks to avoid synchronous protocol requests.
+  ## A single oversized callback may occupy an otherwise empty queue.
+  let bytes = methodName.len + params.len
+  while connection.maxQueuedBytes > 0 and connection.queuedBytes > 0 and
+      connection.queuedBytes + bytes > connection.maxQueuedBytes:
+    if connection.closing or connection.failed:
+      raise newException(AcpTransportError, "Connection closed during notification delivery")
+    wait(connection.changed, connection.lock)
+  if connection.closing or connection.failed:
+    raise newException(AcpTransportError, "Connection closed during notification delivery")
   let event = cast[Event](allocShared0(sizeof(EventObj)))
   event.methodName = sharedText(methodName)
   event.params = sharedText(params)
@@ -172,6 +183,7 @@ proc queueEventLocked(connection: Connection, methodName, params: string) =
   if connection.eventTail == nil: connection.eventHead = event
   else: connection.eventTail.next = event
   connection.eventTail = event
+  connection.queuedBytes += bytes
   broadcast(connection.changed)
 
 proc registerElicitationLocked(connection: Connection, node: JsonNode, outbound: bool) =
@@ -975,9 +987,13 @@ proc readerThread(connection: Connection) {.thread.} =
           var start = 0
           for position in 0 ..< pending.len:
             if pending[position] == '\n':
+              if connection.maxMessageBytes > 0 and position - start > connection.maxMessageBytes:
+                raise newException(AcpProtocolError, "ACP message exceeds configured byte limit")
               connection.handleLine(pending[start ..< position])
               start = position + 1
           if start > 0: pending = pending[start .. ^1]
+          if connection.maxMessageBytes > 0 and pending.len > connection.maxMessageBytes:
+            raise newException(AcpProtocolError, "ACP message exceeds configured byte limit")
   except CatchableError as error:
     connection.fail(error.msg, error of AcpProtocolError or error of AcpRpcError)
 
@@ -992,6 +1008,8 @@ proc notifierThread(connection: Connection) {.thread.} =
     if event != nil:
       connection.eventHead = event.next
       if connection.eventHead == nil: connection.eventTail = nil
+      connection.queuedBytes -= event.methodName.length + event.params.length
+      broadcast(connection.changed)
     release(connection.lock)
     if event == nil: break
     try:
@@ -1056,9 +1074,11 @@ proc managementThread(connection: Connection) {.thread.} =
 proc newConnection*(inputFd, outputFd: cint, requestHandler: RequestHandler,
     notificationHandler: NotificationHandler, userData: pointer = nil,
     errorFd: cint = -1, logHandler: LogHandler = nil,
-    workerThreads = DefaultWorkerThreads): Connection =
+    workerThreads = DefaultWorkerThreads, maxMessageBytes = 0, maxQueuedBytes = 0): Connection =
   ## Start a Linux stdio connection over caller-owned file descriptors.
   if workerThreads < 1: raise newException(ValueError, "At least one request worker is required")
+  if maxMessageBytes < 0 or maxQueuedBytes < 0:
+    raise newException(ValueError, "Transport byte limits cannot be negative")
   result = cast[Connection](allocShared0(sizeof(ConnectionObj)))
   initLock(result.lock)
   initCond(result.changed)
@@ -1070,6 +1090,8 @@ proc newConnection*(inputFd, outputFd: cint, requestHandler: RequestHandler,
   result.notificationHandler = notificationHandler
   result.logHandler = logHandler
   result.userData = userData
+  result.maxMessageBytes = maxMessageBytes
+  result.maxQueuedBytes = maxQueuedBytes
   var
     notifierStarted, writerStarted, managerStarted: bool
     flagsChanged = 0

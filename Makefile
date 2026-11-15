@@ -42,6 +42,7 @@ test: build/fixture-agent build/raw-agent build/session-agent build/features-age
 	$(NIM) r --out:build/test_sessions tests/test_sessions.nim
 	$(NIM) r --out:build/test_features tests/test_features.nim
 	$(NIM) r --out:build/test_coverage tests/test_coverage.nim
+	$(NIM) r --out:build/test_delivery tests/test_delivery.nim
 
 test-arc:
 	ACPORT_TEST_MM=arc $(MAKE) test
