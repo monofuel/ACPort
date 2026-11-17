@@ -85,10 +85,11 @@ the connection module. Callback data follows the existing owned-buffer thread
 rules. Transport-owner code must not wait synchronously for a response that
 depends on that same owner's next pump iteration.
 
-Driven connections default to one request worker, a 1 MiB message limit, and
-2 MiB callback and outgoing queues. Saturation fails explicitly instead of
-blocking the caller that must pump the connection. Zero limits select these
-bounded defaults. Applications may set larger positive limits when needed.
+Driven connections default to one request worker and no message or queue size
+limits. Zero means unlimited, matching stdio. Applications can opt into the
+existing `maxMessageBytes` and `maxQueuedBytes` options. An explicitly bounded
+callback queue fails on saturation instead of blocking the caller that must
+pump the connection. Outgoing messages have no library-imposed size limit.
 
 Portable protocol codecs are available through `import acport` on every
 platform. The threaded connection API requires POSIX. Local process launch
@@ -98,8 +99,10 @@ process is unavailable for driven clients.
 Run the process-free tests on macOS or Linux with
 `ACPORT_TEST_MM=arc make test-driven` and
 `ACPORT_TEST_MM=orc make test-driven`. These exercise fragmented input,
-bidirectional requests, callback ordering, cancellation, EOF, queue limits,
-and the synchronous client facade with an independent byte pump.
+bidirectional requests, callback ordering, cancellation, EOF, optional caller
+limits, and the synchronous client facade with an independent byte pump.
+Image tests cover frames above 1 MiB, queued traffic above 2 MiB, and 3 MiB
+image prompts and replies with both default options and explicit zero limits.
 
 ## Verification boundaries
 

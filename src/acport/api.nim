@@ -7,7 +7,7 @@ export RequestContext, LogHandler, getRequestId, isCancelled
 type
   ClientOptions* = object
     notices*, compaction*: bool
-    ## Zero limits retain stdio behavior; driven connections use bounded defaults.
+    ## Zero disables optional byte limits for stdio and driven connections.
     ## Bounded callbacks must not make synchronous requests on this connection.
     maxMessageBytes*, maxQueuedBytes*: int
   McpCapabilities* = object
@@ -465,12 +465,11 @@ proc connect*(client: AcpClient, command: string, args: seq[string] = @[],
   client.driven = false
   inc client.generation
 
-proc connectDriven*(client: AcpClient, workerThreads = 1,
-    maxOutgoingBytes = DefaultDrivenQueueBytes) =
+proc connectDriven*(client: AcpClient, workerThreads = 1) =
   ## Connect through caller-owned I/O without launching or owning a process.
   ## Drive bytes on one thread while synchronous protocol calls run on another.
   ## Join those callers before closing the client on its owning thread.
-  ## Zero message/queued options use 1 MiB/2 MiB defaults in this mode.
+  ## Zero message and callback queue options remain unlimited, as with stdio.
   if client.connection != nil:
     raise newException(AcpProtocolError, "Client is already connected")
   client.connection = newDrivenConnection(
@@ -480,8 +479,7 @@ proc connectDriven*(client: AcpClient, workerThreads = 1,
     logHandler = clientLog,
     workerThreads = workerThreads,
     maxMessageBytes = client.options.maxMessageBytes,
-    maxQueuedBytes = client.options.maxQueuedBytes,
-    maxOutgoingBytes = maxOutgoingBytes
+    maxQueuedBytes = client.options.maxQueuedBytes
   )
   client.driven = true
   inc client.generation

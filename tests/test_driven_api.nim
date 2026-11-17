@@ -3,6 +3,8 @@ import
   acport,
   acport/connection
 
+const ImageDataBytes = 3 * 1024 * 1024
+
 type Capture = object
   client: AcpClient
   stop: Atomic[bool]
@@ -10,16 +12,30 @@ type Capture = object
   terminalInvoked: Atomic[bool]
   updates: Atomic[int]
   logs: Atomic[int]
+  images: Atomic[int]
+  imageBytes: Atomic[int]
+  invalidImage: Atomic[bool]
   lock: Lock
   text, error: SharedText
+
+proc imageData(): string =
+  ## Supplies deterministic base64 data larger than the former outgoing limit.
+  "QUJD".repeat(ImageDataBytes div 4)
 
 proc update(update: SessionUpdate, data: pointer) {.gcsafe.} =
   ## Transfers callback text as an owned buffer before signaling delivery.
   let capture = cast[ptr Capture](data)
   if update.kind == agentMessageChunk:
-    withLock capture.lock:
-      freeText(capture.text)
-      capture.text = sharedText(update.content.text)
+    if update.content.kind == imageContent:
+      if update.content.data != imageData() or
+        update.content.mimeType != "image/png":
+          capture.invalidImage.store(true)
+      discard capture.images.fetchAdd(1)
+      discard capture.imageBytes.fetchAdd(update.content.data.len)
+    else:
+      withLock capture.lock:
+        freeText(capture.text)
+        capture.text = sharedText(update.content.text)
     discard capture.updates.fetchAdd(1)
 
 proc log(data: pointer, text: string) {.gcsafe.} =
@@ -42,7 +58,7 @@ proc respond(capture: ptr Capture, request: JsonNode) =
     capture.authAdvertised.store(capabilities.hasKey("auth"))
     value = %*{
       "protocolVersion": 1,
-      "agentCapabilities": {},
+      "agentCapabilities": {"promptCapabilities": {"image": true}},
       "authMethods": [{"id": "interactive", "name": "Login",
         "type": "terminal", "args": []}]
     }
@@ -51,12 +67,20 @@ proc respond(capture: ptr Capture, request: JsonNode) =
     value = %*{"sessionId": "driven-session"}
   of "session/prompt":
     doAssert request["params"]["sessionId"].getStr() == "driven-session"
-    doAssert request["params"]["prompt"][0]["text"].getStr() == "Hello"
+    let content = request["params"]["prompt"][0]
+    var response: JsonNode
+    if content["type"].getStr() == "image":
+      doAssert content["mimeType"].getStr() == "image/png"
+      doAssert content["data"].getStr() == imageData()
+      response = content
+    else:
+      doAssert content["text"].getStr() == "Hello"
+      response = %*{"type": "text", "text": "Hello, 世界."}
     client.feed($( %*{
       "jsonrpc": "2.0", "method": "session/update",
       "params": {"sessionId": "driven-session", "update": {
         "sessionUpdate": "agent_message_chunk",
-        "content": {"type": "text", "text": "Hello, 世界."}
+        "content": response
       }}
     }) & "\n")
     value = %*{"stopReason": "end_turn"}
@@ -98,17 +122,24 @@ template rejects(errorType: typedesc, expression: untyped) =
       rejected = true
     doAssert rejected
 
-proc testDrivenApi() =
+proc testDrivenApi(explicitZero: bool) =
   ## Exercises process-free initialization, callbacks, session turns, and EOF.
   echo "Testing caller-driven public ACP client API"
   var capture: Capture
   initLock(capture.lock)
-  let client = newAcpClient("driven-test", "1", ClientHandlers(
-    onUpdate: update,
-    onLog: log,
-    onTerminalAuth: terminalAuth,
-    userData: addr capture
-  ))
+  let
+    handlers = ClientHandlers(
+      onUpdate: update,
+      onLog: log,
+      onTerminalAuth: terminalAuth,
+      userData: addr capture
+    )
+    client =
+      if explicitZero:
+        newAcpClient("driven-test", "1", handlers,
+          ClientOptions(maxMessageBytes: 0, maxQueuedBytes: 0))
+      else:
+        newAcpClient("driven-test", "1", handlers)
   capture.client = client
   defer:
     client.close()
@@ -148,6 +179,13 @@ proc testDrivenApi() =
   doAssert capture.logs.load() == 1
   withLock capture.lock:
     doAssert localText(capture.text) == "Hello, 世界."
+  let image = ContentBlock(
+    kind: imageContent, data: imageData(), mimeType: "image/png"
+  )
+  doAssert session.prompt(@[image], 2000).stopReason == endTurn
+  doAssert capture.images.load() == 1
+  doAssert capture.imageBytes.load() == ImageDataBytes
+  doAssert not capture.invalidImage.load()
   rejects(AcpTransportError):
     discard client.requestExtension("_eof", %*{}, 2000)
 
@@ -168,5 +206,6 @@ proc testDrivenOptions() =
     portable.feed("")
     doAssert portable.takeOutgoing() == ""
 
-testDrivenApi()
+testDrivenApi(false)
+testDrivenApi(true)
 testDrivenOptions()

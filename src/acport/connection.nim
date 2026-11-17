@@ -89,7 +89,6 @@ type
     eventHead, eventTail: Event
     queued, delivered: uint64
     maxMessageBytes, maxQueuedBytes, queuedBytes: int
-    maxOutgoingBytes, outgoingBytes: int
     callbackThreadId: int
     requestHandler: RequestHandler
     notificationHandler: NotificationHandler
@@ -103,8 +102,6 @@ const
   IoPollMs = 50
   ReadBufferSize = 16384
   DefaultWorkerThreads* = 16
-  DefaultDrivenMessageBytes* = 1024 * 1024
-  DefaultDrivenQueueBytes* = 2 * 1024 * 1024
 
 proc sharedText*(text: string): SharedText =
   ## Copy text into independently owned shared memory.
@@ -171,8 +168,8 @@ proc cancelRpcLocked(connection: Connection, id: string, incoming: bool) =
 
 proc queueEventLocked(connection: Connection, methodName, params: string) =
   ## Append an ordered callback event while holding the state lock.
-  ## Bounded delivery requires callbacks to avoid synchronous protocol requests.
-  ## A single oversized callback may occupy an otherwise empty queue.
+  ## Optional queue bounds must not block the caller-owned byte pump.
+  ## Descriptor I/O may admit one oversized callback into an empty queue.
   let bytes = methodName.len + params.len
   if connection.driven and connection.maxQueuedBytes > 0 and
     bytes > connection.maxQueuedBytes - connection.queuedBytes:
@@ -471,16 +468,10 @@ proc enqueue(connection: Connection, node: JsonNode) =
     deallocShared(outgoing)
     raise newException(AcpProtocolError, "Outgoing JSON must be UTF-8")
   outgoing.text = sharedText(text)
-  var overflow = false
   try:
     withLock connection.lock:
       if connection.closing or connection.failed:
         raise newException(AcpTransportError, "Connection is closed")
-      if connection.maxOutgoingBytes > 0 and
-        text.len > connection.maxOutgoingBytes - connection.outgoingBytes:
-          overflow = true
-          raise newException(AcpTransportError,
-            "ACP outgoing queue exceeded its configured byte limit")
       if node.field("method").getStr() == "session/update":
         connection.applyUpdateLocked(node.field("params"))
       elif node.field("method").getStr() == "elicitation/create":
@@ -502,13 +493,10 @@ proc enqueue(connection: Connection, node: JsonNode) =
       if connection.outgoingTail == nil: connection.outgoingHead = outgoing
       else: connection.outgoingTail.next = outgoing
       connection.outgoingTail = outgoing
-      connection.outgoingBytes += text.len
       broadcast(connection.changed)
-  except CatchableError as error:
+  except CatchableError:
     freeText(outgoing.text)
     deallocShared(outgoing)
-    if overflow:
-      connection.fail(error.msg)
     raise
 
 proc notify*(connection: Connection, methodName: string, params: JsonNode) =
@@ -948,7 +936,6 @@ proc writerThread(connection: Connection) {.thread.} =
       if outgoing != nil:
         connection.outgoingHead = outgoing.next
         if connection.outgoingHead == nil: connection.outgoingTail = nil
-        connection.outgoingBytes -= outgoing.text.length
       let stopped = connection.closing or connection.failed
       release(connection.lock)
       if outgoing == nil: break
@@ -1155,14 +1142,12 @@ proc newConnection*(inputFd, outputFd: cint, requestHandler: RequestHandler,
 proc newDrivenConnection*(requestHandler: RequestHandler,
     notificationHandler: NotificationHandler, userData: pointer = nil,
     logHandler: LogHandler = nil, workerThreads = 1,
-    maxMessageBytes = DefaultDrivenMessageBytes,
-    maxQueuedBytes = DefaultDrivenQueueBytes,
-    maxOutgoingBytes = DefaultDrivenQueueBytes): Connection =
-  ## Starts shared RPC dispatch with caller-owned byte I/O and bounded queues.
-  ## Zero byte limits select the bounded defaults for externally driven I/O.
+    maxMessageBytes = 0, maxQueuedBytes = 0): Connection =
+  ## Starts shared RPC dispatch with caller-owned byte I/O.
+  ## Zero disables optional byte limits, matching descriptor-owned connections.
   if workerThreads < 1:
     raise newException(ValueError, "At least one request worker is required")
-  if maxMessageBytes < 0 or maxQueuedBytes < 0 or maxOutgoingBytes < 0:
+  if maxMessageBytes < 0 or maxQueuedBytes < 0:
     raise newException(ValueError, "Transport byte limits cannot be negative")
   result = cast[Connection](allocShared0(sizeof(ConnectionObj)))
   initLock(result.lock)
@@ -1176,12 +1161,8 @@ proc newDrivenConnection*(requestHandler: RequestHandler,
   result.notificationHandler = notificationHandler
   result.logHandler = logHandler
   result.userData = userData
-  result.maxMessageBytes =
-    if maxMessageBytes == 0: DefaultDrivenMessageBytes else: maxMessageBytes
-  result.maxQueuedBytes =
-    if maxQueuedBytes == 0: DefaultDrivenQueueBytes else: maxQueuedBytes
-  result.maxOutgoingBytes =
-    if maxOutgoingBytes == 0: DefaultDrivenQueueBytes else: maxOutgoingBytes
+  result.maxMessageBytes = maxMessageBytes
+  result.maxQueuedBytes = maxQueuedBytes
   var notifierStarted, managerStarted: bool
   try:
     result.workers = cast[ptr UncheckedArray[Thread[Connection]]](
@@ -1215,7 +1196,7 @@ proc requireDriven(connection: Connection) =
 
 proc feed*(connection: Connection, bytes: string) =
   ## Accepts fragmented NDJSON on the transport owner thread without doing I/O.
-  ## Callback-queue saturation fails explicitly instead of blocking the caller.
+  ## Explicit callback bounds fail instead of blocking the transport owner.
   connection.requireDriven()
   var pending = localText(connection.inputPending)
   freeText(connection.inputPending)
@@ -1224,16 +1205,18 @@ proc feed*(connection: Connection, bytes: string) =
     var start = 0
     for position in 0 ..< bytes.len:
       if bytes[position] == '\n':
-        if position - start > connection.maxMessageBytes - pending.len:
-          raise newException(AcpProtocolError,
-            "ACP message exceeds configured byte limit")
+        if connection.maxMessageBytes > 0 and
+          position - start > connection.maxMessageBytes - pending.len:
+            raise newException(AcpProtocolError,
+              "ACP message exceeds configured byte limit")
         pending.add(bytes[start ..< position])
         connection.handleLine(pending)
         pending.setLen(0)
         start = position + 1
-    if bytes.len - start > connection.maxMessageBytes - pending.len:
-      raise newException(AcpProtocolError,
-        "ACP message exceeds configured byte limit")
+    if connection.maxMessageBytes > 0 and
+      bytes.len - start > connection.maxMessageBytes - pending.len:
+        raise newException(AcpProtocolError,
+          "ACP message exceeds configured byte limit")
     pending.add(bytes[start ..< bytes.len])
     if pending.len > 0:
       connection.inputPending = sharedText(pending)
@@ -1255,7 +1238,6 @@ proc takeOutgoing*(connection: Connection): string =
       outgoing = next
     connection.outgoingHead = nil
     connection.outgoingTail = nil
-    connection.outgoingBytes = 0
 
 proc feedError*(connection: Connection, bytes: string) =
   ## Forwards optional transport diagnostics through the ordered log callback.
@@ -1318,5 +1300,4 @@ proc close*(connection: Connection) =
     outgoing = next
   connection.outgoingHead = nil
   connection.outgoingTail = nil
-  connection.outgoingBytes = 0
   connection.release()

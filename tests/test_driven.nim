@@ -2,12 +2,21 @@ import
   std/[atomics, json, monotimes, os, strutils, times],
   acport/[connection, protocol]
 
+const ImageDataBytes = 1536 * 1024
+
 type Capture = object
   updates: Atomic[int]
   logs: Atomic[int]
   hold: Atomic[bool]
   entered: Atomic[bool]
   unicode: Atomic[bool]
+  images: Atomic[int]
+  imageBytes: Atomic[int]
+  invalidImage: Atomic[bool]
+
+proc imageData(): string =
+  ## Creates deterministic base64 data without embedding a large source literal.
+  "QUJD".repeat(ImageDataBytes div 4)
 
 proc handleRequest(context: RequestContext, methodName: string,
     params: JsonNode): JsonNode {.gcsafe.} =
@@ -32,7 +41,14 @@ proc handleNotification(context: RequestContext, methodName: string,
     capture.entered.store(true)
     while capture.hold.load():
       sleep(1)
-    if params["update"]["content"]["text"].getStr() == "Hello, 世界.":
+    let content = params["update"]["content"]
+    if content["type"].getStr() == "image":
+      let data = content["data"].getStr()
+      if data != imageData() or content["mimeType"].getStr() != "image/png":
+        capture.invalidImage.store(true)
+      discard capture.images.fetchAdd(1)
+      discard capture.imageBytes.fetchAdd(data.len)
+    elif content["text"].getStr() == "Hello, 世界.":
       capture.unicode.store(true)
     discard capture.updates.fetchAdd(1)
 
@@ -191,9 +207,72 @@ proc testEofAndClose() =
   finished.endInput()
   doAssert completed.waitResponse()["done"].getBool()
 
+proc testLargeImages() =
+  ## Preserves large image frames and queued traffic with default or zero limits.
+  echo "Testing large driven images without application limits"
+  for explicitZero in [false, true]:
+    var capture: Capture
+    capture.hold.store(true)
+    let peer =
+      if explicitZero:
+        newDrivenConnection(
+          nil, handleNotification, addr capture,
+          maxMessageBytes = 0, maxQueuedBytes = 0
+        )
+      else:
+        newDrivenConnection(nil, handleNotification, addr capture)
+    defer:
+      capture.hold.store(false)
+      peer.close()
+    let
+      params = %*{"sessionId": "session", "update": {
+        "sessionUpdate": "agent_message_chunk",
+        "content": {
+          "type": "image", "mimeType": "image/png", "data": imageData()
+        }
+      }}
+      frame = $(%*{
+        "jsonrpc": "2.0", "method": "session/update", "params": params
+      }) & "\n"
+      pending = peer.startRequest("_request", %*{})
+      request = parseJson(peer.takeOutgoing().strip())
+    doAssert frame.len > 1024 * 1024
+    peer.feed(notification("Hello, 世界."))
+    let started = getMonoTime()
+    while not capture.entered.load():
+      doAssert (getMonoTime() - started).inSeconds < 5
+      sleep(1)
+    let split = 1024 * 1024 + 16
+    peer.feed(frame[0 ..< split])
+    peer.feed(frame[split .. ^1])
+    peer.feed(frame)
+    peer.feed($( %*{
+      "jsonrpc": "2.0", "id": request["id"], "result": {}
+    }) & "\n")
+    doAssert not pending.isReady()
+    for i in 0 ..< 2:
+      peer.notify("session/update", params)
+    let outgoing = peer.takeOutgoing()
+    doAssert outgoing.len > 2 * 1024 * 1024
+    var count = 0
+    for line in outgoing.splitLines():
+      if line.len > 0:
+        let content = parseJson(line)["params"]["update"]["content"]
+        doAssert content["type"].getStr() == "image"
+        doAssert content["data"].getStr() == imageData()
+        inc count
+    doAssert count == 2
+    capture.hold.store(false)
+    pending.waitReady()
+    discard pending.waitResponse()
+    doAssert capture.updates.load() == 3
+    doAssert capture.images.load() == 2
+    doAssert capture.imageBytes.load() == 2 * ImageDataBytes
+    doAssert not capture.invalidImage.load()
+
 proc testLimitsAndParseErrors() =
-  ## Fails bounded buffers explicitly and preserves standard parse errors.
-  echo "Testing driven buffer limits and malformed JSON"
+  ## Applies only explicit caller limits and preserves standard parse errors.
+  echo "Testing optional driven limits and malformed JSON"
   block:
     let peer = newDrivenConnection(nil, nil, maxMessageBytes = 64)
     defer: peer.close()
@@ -203,16 +282,6 @@ proc testLimitsAndParseErrors() =
     try:
       peer.feed(repeat('x', 65))
     except AcpProtocolError:
-      bounded = true
-    doAssert bounded
-  block:
-    let peer = newDrivenConnection(nil, nil, maxOutgoingBytes = 80)
-    defer: peer.close()
-    peer.notify("_event", %*{})
-    var bounded = false
-    try:
-      peer.notify("_event", %*{})
-    except AcpTransportError:
       bounded = true
     doAssert bounded
   block:
@@ -242,5 +311,6 @@ testDrivenRequests()
 testCallbackBarrier()
 testCancellation()
 testEofAndClose()
+testLargeImages()
 testLimitsAndParseErrors()
 echo "Externally driven ACP tests passed."

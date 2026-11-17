@@ -5,7 +5,7 @@
 - Add caller-driven byte connections using the existing threaded RPC engine.
 - Expose portable protocol codecs and the POSIX driven client API without
   requiring local process launch.
-- Bound driven input messages, callback delivery, and outgoing queues.
+- Keep driven messages and queues unlimited by default, matching stdio.
 - Reject local terminal authentication for process-free clients.
 
 ## 1.3.0
