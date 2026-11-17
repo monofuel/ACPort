@@ -1,6 +1,7 @@
 # ACP v1 coverage
 
-ACPort 1.3 targets Linux stdio and the stable v1 schema at
+ACPort 1.3 targets Linux stdio, caller-driven byte connections on POSIX, and
+the stable v1 schema at
 [`c392d7e9d1de01337b749c0070929933e9f6f09f`](https://github.com/agentclientprotocol/agent-client-protocol/blob/c392d7e9d1de01337b749c0070929933e9f6f09f/schema/v1/schema.json).
 All 25 named methods/notifications in that snapshot have dispatch or routing
 support. This is an endpoint inventory, not a claim of formal ACP certification
@@ -63,6 +64,43 @@ storage, authentication policy, session persistence, and model behavior are not
 library implementations. Schema `x-deserialize-*` recovery hints are not an
 exhaustive compatibility guarantee: malformed known payloads can raise errors.
 
+## Caller-driven byte connections
+
+`connectDriven` creates a client connection without launching a process or
+owning file descriptors. Applications deliver received bytes with `feed`,
+drain complete outgoing NDJSON frames with `takeOutgoing`, pass diagnostics
+with `feedError`, and signal a closed input stream with `endInput`. The caller
+owns transport lifetime, reconnection, and reliable byte delivery.
+
+The lower-level `newDrivenConnection` uses the same request routing, session
+snapshots, cancellation, and ordered callback dispatch as stdio. It starts
+request workers and callback dispatch, but no I/O threads. Drive each
+connection from one transport-owner thread and preserve the outgoing order,
+including any bytes not yet accepted by the destination.
+
+High-level initialization and session calls remain synchronous. Keep the
+transport pump running on a separate thread while those calls wait. A custom
+event loop can instead use `startRequest`, `isReady`, and `waitResponse` from
+the connection module. Callback data follows the existing owned-buffer thread
+rules. Transport-owner code must not wait synchronously for a response that
+depends on that same owner's next pump iteration.
+
+Driven connections default to one request worker, a 1 MiB message limit, and
+2 MiB callback and outgoing queues. Saturation fails explicitly instead of
+blocking the caller that must pump the connection. Zero limits select these
+bounded defaults. Applications may set larger positive limits when needed.
+
+Portable protocol codecs are available through `import acport` on every
+platform. The threaded connection API requires POSIX. Local process launch
+remains Linux-only, and terminal authentication that relaunches a local
+process is unavailable for driven clients.
+
+Run the process-free tests on macOS or Linux with
+`ACPORT_TEST_MM=arc make test-driven` and
+`ACPORT_TEST_MM=orc make test-driven`. These exercise fragmented input,
+bidirectional requests, callback ordering, cancellation, EOF, queue limits,
+and the synchronous client facade with an independent byte pump.
+
 ## Verification boundaries
 
 `make test-arc` and `make test-orc` run all deterministic suites, including raw
@@ -83,5 +121,7 @@ callbacks and requires the matching outer filesystem/terminal capabilities befor
 creating a session. `ACPORT_TEST_FIXTURE` selects the deterministic backend without
 provider authentication. This is test infrastructure, not a general proxy product.
 
-macOS/Windows, remote HTTP/WebSocket transports, ACP v2, draft/vendor extensions,
-and production filesystem/process/PTY backends are outside the Linux 1.x surface.
+Concrete network transports, Windows threaded connections, non-Linux local
+process launch, ACP v2, draft/vendor extensions, and production filesystem
+or PTY backends are outside this surface. Caller-driven I/O adds no transport
+implementation or persistence policy.

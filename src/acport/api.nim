@@ -7,8 +7,8 @@ export RequestContext, LogHandler, getRequestId, isCancelled
 type
   ClientOptions* = object
     notices*, compaction*: bool
-    ## Zero limits retain existing behavior. Bounded update/log callbacks must
-    ## consume delivery without making synchronous protocol requests.
+    ## Zero limits retain stdio behavior; driven connections use bounded defaults.
+    ## Bounded callbacks must not make synchronous requests on this connection.
     maxMessageBytes*, maxQueuedBytes*: int
   McpCapabilities* = object
     http*, sse*: bool
@@ -101,6 +101,7 @@ type
     generation: uint64
     handlers: ClientHandlers
     options: ClientOptions
+    driven: bool
 
   AcpAgent* = ptr object
     info, authMethods: SharedText
@@ -461,7 +462,53 @@ proc connect*(client: AcpClient, command: string, args: seq[string] = @[],
     raise
   freeText(client.launch)
   client.launch = sharedText($launch)
+  client.driven = false
   inc client.generation
+
+proc connectDriven*(client: AcpClient, workerThreads = 1,
+    maxOutgoingBytes = DefaultDrivenQueueBytes) =
+  ## Connect through caller-owned I/O without launching or owning a process.
+  ## Drive bytes on one thread while synchronous protocol calls run on another.
+  ## Join those callers before closing the client on its owning thread.
+  ## Zero message/queued options use 1 MiB/2 MiB defaults in this mode.
+  if client.connection != nil:
+    raise newException(AcpProtocolError, "Client is already connected")
+  client.connection = newDrivenConnection(
+    clientRequest,
+    clientNotification,
+    userData = client,
+    logHandler = clientLog,
+    workerThreads = workerThreads,
+    maxMessageBytes = client.options.maxMessageBytes,
+    maxQueuedBytes = client.options.maxQueuedBytes,
+    maxOutgoingBytes = maxOutgoingBytes
+  )
+  client.driven = true
+  inc client.generation
+
+proc drivenConnection(client: AcpClient): Connection =
+  ## Check the byte-transport mode without requiring a completed handshake.
+  if client.connection == nil:
+    raise newException(AcpTransportError, "Client is not connected")
+  if not client.driven:
+    raise newException(AcpProtocolError, "Client does not use driven I/O")
+  client.connection
+
+proc feed*(client: AcpClient, bytes: string) =
+  ## Feed protocol bytes on the driving thread, including during initialization.
+  client.drivenConnection().feed(bytes)
+
+proc takeOutgoing*(client: AcpClient): string =
+  ## Transfer complete outgoing frames to the driving thread for delivery.
+  client.drivenConnection().takeOutgoing()
+
+proc feedError*(client: AcpClient, bytes: string) =
+  ## Deliver transport diagnostics separately from framed protocol input.
+  client.drivenConnection().feedError(bytes)
+
+proc endInput*(client: AcpClient) =
+  ## Report peer EOF so blocked requests finish with a transport error.
+  client.drivenConnection().endInput()
 
 proc initialize*(client: AcpClient, timeoutMs = 0, extensionCapabilities: JsonNode = nil,
     meta: JsonNode = nil): InitializeResponse =
@@ -478,7 +525,8 @@ proc initialize*(client: AcpClient, timeoutMs = 0, extensionCapabilities: JsonNo
     capabilities["fs"] = %*{"readTextFile": client.handlers.onReadTextFile != nil,
       "writeTextFile": client.handlers.onWriteTextFile != nil}
   if client.handlers.onCreateTerminal != nil: capabilities["terminal"] = %true
-  if client.handlers.onTerminalAuth != nil: capabilities["auth"] = %*{"terminal": true}
+  if client.handlers.onTerminalAuth != nil and not client.driven:
+    capabilities["auth"] = %*{"terminal": true}
   if client.options.notices: capabilities["session"]["notices"] = newJObject()
   if client.options.compaction: capabilities["session"]["compaction"] = newJObject()
   if client.handlers.onElicitationForm != nil: elicitation["form"] = newJObject()
@@ -513,11 +561,15 @@ proc disconnect(client: AcpClient) =
     client.connection.close()
     client.connection = nil
   client.process.close()
+  client.driven = false
 
 proc authenticateTerminal*(client: AcpClient, methodId: string, timeoutMs = 0): InitializeResponse =
   ## Run host-owned interactive auth on the owner thread, then reconnect only after success.
   let connection = client.requireConnection()
   defer: connection.release()
+  if client.driven:
+    raise newException(AcpProtocolError,
+      "Terminal authentication requires a process-backed connection")
   if client.handlers.onTerminalAuth == nil: raise newException(AcpProtocolError, "Terminal authentication is unsupported")
   var selected: AuthMethod
   var found = false

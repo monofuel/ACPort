@@ -68,6 +68,9 @@ type
   ConnectionObj = object
     lock: Lock
     changed: Cond
+    driven: bool
+    readerStarted, writerStarted: bool
+    inputPending: SharedText
     inputFd, outputFd, errorFd: cint
     originalFlags: array[3, cint]
     closing, failed: bool
@@ -86,6 +89,7 @@ type
     eventHead, eventTail: Event
     queued, delivered: uint64
     maxMessageBytes, maxQueuedBytes, queuedBytes: int
+    maxOutgoingBytes, outgoingBytes: int
     callbackThreadId: int
     requestHandler: RequestHandler
     notificationHandler: NotificationHandler
@@ -99,6 +103,8 @@ const
   IoPollMs = 50
   ReadBufferSize = 16384
   DefaultWorkerThreads* = 16
+  DefaultDrivenMessageBytes* = 1024 * 1024
+  DefaultDrivenQueueBytes* = 2 * 1024 * 1024
 
 proc sharedText*(text: string): SharedText =
   ## Copy text into independently owned shared memory.
@@ -168,6 +174,10 @@ proc queueEventLocked(connection: Connection, methodName, params: string) =
   ## Bounded delivery requires callbacks to avoid synchronous protocol requests.
   ## A single oversized callback may occupy an otherwise empty queue.
   let bytes = methodName.len + params.len
+  if connection.driven and connection.maxQueuedBytes > 0 and
+    bytes > connection.maxQueuedBytes - connection.queuedBytes:
+      raise newException(AcpTransportError,
+        "ACP callback queue exceeded its configured byte limit")
   while connection.maxQueuedBytes > 0 and connection.queuedBytes > 0 and
       connection.queuedBytes + bytes > connection.maxQueuedBytes:
     if connection.closing or connection.failed:
@@ -261,6 +271,7 @@ proc release*(connection: Connection) =
       session = next
     freeText(connection.failure)
     freeText(connection.settings)
+    freeText(connection.inputPending)
     deallocShared(connection.workers)
     deinitCond(connection.changed)
     deinitLock(connection.lock)
@@ -460,10 +471,16 @@ proc enqueue(connection: Connection, node: JsonNode) =
     deallocShared(outgoing)
     raise newException(AcpProtocolError, "Outgoing JSON must be UTF-8")
   outgoing.text = sharedText(text)
+  var overflow = false
   try:
     withLock connection.lock:
       if connection.closing or connection.failed:
         raise newException(AcpTransportError, "Connection is closed")
+      if connection.maxOutgoingBytes > 0 and
+        text.len > connection.maxOutgoingBytes - connection.outgoingBytes:
+          overflow = true
+          raise newException(AcpTransportError,
+            "ACP outgoing queue exceeded its configured byte limit")
       if node.field("method").getStr() == "session/update":
         connection.applyUpdateLocked(node.field("params"))
       elif node.field("method").getStr() == "elicitation/create":
@@ -485,10 +502,13 @@ proc enqueue(connection: Connection, node: JsonNode) =
       if connection.outgoingTail == nil: connection.outgoingHead = outgoing
       else: connection.outgoingTail.next = outgoing
       connection.outgoingTail = outgoing
+      connection.outgoingBytes += text.len
       broadcast(connection.changed)
-  except CatchableError:
+  except CatchableError as error:
     freeText(outgoing.text)
     deallocShared(outgoing)
+    if overflow:
+      connection.fail(error.msg)
     raise
 
 proc notify*(connection: Connection, methodName: string, params: JsonNode) =
@@ -928,6 +948,7 @@ proc writerThread(connection: Connection) {.thread.} =
       if outgoing != nil:
         connection.outgoingHead = outgoing.next
         if connection.outgoingHead == nil: connection.outgoingTail = nil
+        connection.outgoingBytes -= outgoing.text.length
       let stopped = connection.closing or connection.failed
       release(connection.lock)
       if outgoing == nil: break
@@ -1115,7 +1136,9 @@ proc newConnection*(inputFd, outputFd: cint, requestHandler: RequestHandler,
     notifierStarted = true
     createThread(result.writer, writerThread, result)
     writerStarted = true
+    result.writerStarted = true
     createThread(result.reader, readerThread, result)
+    result.readerStarted = true
   except CatchableError:
     withLock result.lock:
       result.closing = true
@@ -1128,6 +1151,130 @@ proc newConnection*(inputFd, outputFd: cint, requestHandler: RequestHandler,
       if index < flagsChanged and fd >= 0: discard fcntl(fd, F_SETFL, result.originalFlags[index])
     result.release()
     raise
+
+proc newDrivenConnection*(requestHandler: RequestHandler,
+    notificationHandler: NotificationHandler, userData: pointer = nil,
+    logHandler: LogHandler = nil, workerThreads = 1,
+    maxMessageBytes = DefaultDrivenMessageBytes,
+    maxQueuedBytes = DefaultDrivenQueueBytes,
+    maxOutgoingBytes = DefaultDrivenQueueBytes): Connection =
+  ## Starts shared RPC dispatch with caller-owned byte I/O and bounded queues.
+  ## Zero byte limits select the bounded defaults for externally driven I/O.
+  if workerThreads < 1:
+    raise newException(ValueError, "At least one request worker is required")
+  if maxMessageBytes < 0 or maxQueuedBytes < 0 or maxOutgoingBytes < 0:
+    raise newException(ValueError, "Transport byte limits cannot be negative")
+  result = cast[Connection](allocShared0(sizeof(ConnectionObj)))
+  initLock(result.lock)
+  initCond(result.changed)
+  result.references = 1
+  result.driven = true
+  result.inputFd = -1
+  result.outputFd = -1
+  result.errorFd = -1
+  result.requestHandler = requestHandler
+  result.notificationHandler = notificationHandler
+  result.logHandler = logHandler
+  result.userData = userData
+  result.maxMessageBytes =
+    if maxMessageBytes == 0: DefaultDrivenMessageBytes else: maxMessageBytes
+  result.maxQueuedBytes =
+    if maxQueuedBytes == 0: DefaultDrivenQueueBytes else: maxQueuedBytes
+  result.maxOutgoingBytes =
+    if maxOutgoingBytes == 0: DefaultDrivenQueueBytes else: maxOutgoingBytes
+  var notifierStarted, managerStarted: bool
+  try:
+    result.workers = cast[ptr UncheckedArray[Thread[Connection]]](
+      allocShared0(workerThreads * sizeof(Thread[Connection])))
+    for i in 0 ..< workerThreads:
+      createThread(result.workers[i], workerThread, result)
+      inc result.workerCount
+    createThread(result.manager, managementThread, result)
+    managerStarted = true
+    createThread(result.notifier, notifierThread, result)
+    notifierStarted = true
+  except CatchableError:
+    withLock result.lock:
+      result.closing = true
+      broadcast(result.changed)
+    if notifierStarted: joinThread(result.notifier)
+    if managerStarted: joinThread(result.manager)
+    for i in 0 ..< result.workerCount: joinThread(result.workers[i])
+    result.release()
+    raise
+
+proc requireDriven(connection: Connection) =
+  ## Rejects byte-pump operations on descriptor-owned or closed connections.
+  if not connection.driven:
+    raise newException(ValueError, "This connection owns its descriptor I/O")
+  withLock connection.lock:
+    if connection.closing or connection.failed:
+      raise newException(AcpTransportError,
+        if connection.failure != nil: localText(connection.failure)
+        else: "Connection is closed")
+
+proc feed*(connection: Connection, bytes: string) =
+  ## Accepts fragmented NDJSON on the transport owner thread without doing I/O.
+  ## Callback-queue saturation fails explicitly instead of blocking the caller.
+  connection.requireDriven()
+  var pending = localText(connection.inputPending)
+  freeText(connection.inputPending)
+  connection.inputPending = nil
+  try:
+    var start = 0
+    for position in 0 ..< bytes.len:
+      if bytes[position] == '\n':
+        if position - start > connection.maxMessageBytes - pending.len:
+          raise newException(AcpProtocolError,
+            "ACP message exceeds configured byte limit")
+        pending.add(bytes[start ..< position])
+        connection.handleLine(pending)
+        pending.setLen(0)
+        start = position + 1
+    if bytes.len - start > connection.maxMessageBytes - pending.len:
+      raise newException(AcpProtocolError,
+        "ACP message exceeds configured byte limit")
+    pending.add(bytes[start ..< bytes.len])
+    if pending.len > 0:
+      connection.inputPending = sharedText(pending)
+  except CatchableError as error:
+    connection.fail(error.msg, error of AcpProtocolError or error of AcpRpcError)
+    raise
+
+proc takeOutgoing*(connection: Connection): string =
+  ## Drains complete NDJSON frames for delivery by the transport owner thread.
+  ## The caller retains returned bytes until its transport has accepted them.
+  connection.requireDriven()
+  withLock connection.lock:
+    var outgoing = connection.outgoingHead
+    while outgoing != nil:
+      let next = outgoing.next
+      result.add(localText(outgoing.text))
+      freeText(outgoing.text)
+      deallocShared(outgoing)
+      outgoing = next
+    connection.outgoingHead = nil
+    connection.outgoingTail = nil
+    connection.outgoingBytes = 0
+
+proc feedError*(connection: Connection, bytes: string) =
+  ## Forwards optional transport diagnostics through the ordered log callback.
+  connection.requireDriven()
+  if bytes.len > 0 and connection.logHandler != nil:
+    try:
+      connection.queueEvent("$/stderr", bytes)
+    except CatchableError as error:
+      connection.fail(error.msg, error of AcpProtocolError or error of AcpRpcError)
+      raise
+
+proc endInput*(connection: Connection) =
+  ## Reports peer EOF separately from an empty, temporarily idle read.
+  connection.requireDriven()
+  let partial = connection.inputPending != nil
+  connection.fail(
+    if partial: "EOF inside ACP message" else: "Peer closed the byte stream",
+    partial
+  )
 
 proc waitClosed*(connection: Connection) =
   ## Block until EOF, a transport failure, or an explicit close request.
@@ -1146,8 +1293,8 @@ proc close*(connection: Connection) =
       task.cancelled = true
       task = task.activeNext
     broadcast(connection.changed)
-  joinThread(connection.reader)
-  joinThread(connection.writer)
+  if connection.readerStarted: joinThread(connection.reader)
+  if connection.writerStarted: joinThread(connection.writer)
   joinThread(connection.notifier)
   joinThread(connection.manager)
   for i in 0 ..< connection.workerCount: joinThread(connection.workers[i])
@@ -1163,4 +1310,13 @@ proc close*(connection: Connection) =
         link = addr pending.next
   for index, fd in [connection.inputFd, connection.outputFd, connection.errorFd]:
     if fd >= 0: discard fcntl(fd, F_SETFL, connection.originalFlags[index])
+  var outgoing = connection.outgoingHead
+  while outgoing != nil:
+    let next = outgoing.next
+    freeText(outgoing.text)
+    deallocShared(outgoing)
+    outgoing = next
+  connection.outgoingHead = nil
+  connection.outgoingTail = nil
+  connection.outgoingBytes = 0
   connection.release()
