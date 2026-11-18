@@ -1,6 +1,9 @@
 import
-  std/[json, locks, monotimes, os, posix, times, unicode],
+  std/[json, locks, monotimes, os, times, unicode],
   ./[elicitation_protocol, events_protocol, protocol, session_protocol]
+
+when defined(posix):
+  import std/posix
 
 type
   SharedText* = ptr object
@@ -68,6 +71,9 @@ type
   ConnectionObj = object
     lock: Lock
     changed: Cond
+    driven: bool
+    readerStarted, writerStarted: bool
+    inputPending: SharedText
     inputFd, outputFd, errorFd: cint
     originalFlags: array[3, cint]
     closing, failed: bool
@@ -165,9 +171,13 @@ proc cancelRpcLocked(connection: Connection, id: string, incoming: bool) =
 
 proc queueEventLocked(connection: Connection, methodName, params: string) =
   ## Append an ordered callback event while holding the state lock.
-  ## Bounded delivery requires callbacks to avoid synchronous protocol requests.
-  ## A single oversized callback may occupy an otherwise empty queue.
+  ## Optional queue bounds must not block the caller-owned byte pump.
+  ## Descriptor I/O may admit one oversized callback into an empty queue.
   let bytes = methodName.len + params.len
+  if connection.driven and connection.maxQueuedBytes > 0 and
+    bytes > connection.maxQueuedBytes - connection.queuedBytes:
+      raise newException(AcpTransportError,
+        "ACP callback queue exceeded its configured byte limit")
   while connection.maxQueuedBytes > 0 and connection.queuedBytes > 0 and
       connection.queuedBytes + bytes > connection.maxQueuedBytes:
     if connection.closing or connection.failed:
@@ -261,6 +271,7 @@ proc release*(connection: Connection) =
       session = next
     freeText(connection.failure)
     freeText(connection.settings)
+    freeText(connection.inputPending)
     deallocShared(connection.workers)
     deinitCond(connection.changed)
     deinitLock(connection.lock)
@@ -604,19 +615,38 @@ proc startRequest*(connection: Connection, methodName: string,
   except CatchableError as error:
     connection.fail(error.msg, error of AcpProtocolError or error of AcpRpcError)
 
+when defined(windows):
+  proc sleepCondition(
+    condition: var Cond,
+    lock: var Lock,
+    milliseconds: uint32
+  ): int32 {.stdcall, dynlib: "kernel32", importc: "SleepConditionVariableCS".}
+    ## Waits on Nim's native Windows condition and critical section.
+
 proc timedWait(connection: Connection, milliseconds: int) =
   ## Sleep on the state condition, with an optional bounded wakeup.
   if milliseconds <= 0:
     wait(connection.changed, connection.lock)
   else:
-    var deadline: Timespec
-    discard clock_gettime(CLOCK_REALTIME, deadline)
-    deadline.tv_nsec += clong(milliseconds mod 1000) * 1_000_000
-    deadline.tv_sec = posix.Time(clong(deadline.tv_sec) + milliseconds div 1000 + int(deadline.tv_nsec div 1_000_000_000))
-    deadline.tv_nsec = deadline.tv_nsec mod 1_000_000_000
-    let code = pthread_cond_timedwait(cast[ptr Pthread_cond](addr connection.changed),
-      cast[ptr Pthread_mutex](addr connection.lock), addr deadline)
-    if code != 0 and code != ETIMEDOUT: raiseOSError(OSErrorCode(code))
+    when defined(windows):
+      if sleepCondition(connection.changed, connection.lock,
+        uint32(milliseconds)) == 0:
+          let error = osLastError()
+          if error != OSErrorCode(1460):
+            raiseOSError(error)
+    elif defined(posix):
+      var deadline: Timespec
+      discard clock_gettime(CLOCK_REALTIME, deadline)
+      deadline.tv_nsec += clong(milliseconds mod 1000) * 1_000_000
+      deadline.tv_sec = posix.Time(clong(deadline.tv_sec) + milliseconds div 1000 + int(deadline.tv_nsec div 1_000_000_000))
+      deadline.tv_nsec = deadline.tv_nsec mod 1_000_000_000
+      let code = pthread_cond_timedwait(cast[ptr Pthread_cond](addr connection.changed),
+        cast[ptr Pthread_mutex](addr connection.lock), addr deadline)
+      if code != 0 and code != ETIMEDOUT: raiseOSError(OSErrorCode(code))
+    else:
+      release(connection.lock)
+      sleep(milliseconds)
+      acquire(connection.lock)
 
 proc isReady*(pending: PendingRequest): bool =
   ## Test the waiter's completion conditions under the connection lock.
@@ -909,93 +939,94 @@ proc handleLine(connection: Connection, line: string) =
   else:
     connection.sendError(newJNull(), InvalidRequest, "Invalid JSON-RPC message")
 
-proc blockSigpipe() =
-  ## Keep a closed peer pipe from terminating the hosting application.
-  var signals, previous: Sigset
-  discard sigemptyset(signals)
-  discard sigaddset(signals, SIGPIPE)
-  discard pthread_sigmask(SIG_BLOCK, signals, previous)
+when defined(posix):
+  proc blockSigpipe() =
+    ## Keep a closed peer pipe from terminating the hosting application.
+    var signals, previous: Sigset
+    discard sigemptyset(signals)
+    discard sigaddset(signals, SIGPIPE)
+    discard pthread_sigmask(SIG_BLOCK, signals, previous)
 
-proc writerThread(connection: Connection) {.thread.} =
-  ## Serialize outgoing messages and stop even when the peer stops reading.
-  blockSigpipe()
-  try:
-    while true:
-      acquire(connection.lock)
-      while connection.outgoingHead == nil and not connection.closing and not connection.failed:
-        wait(connection.changed, connection.lock)
-      let outgoing = connection.outgoingHead
-      if outgoing != nil:
-        connection.outgoingHead = outgoing.next
-        if connection.outgoingHead == nil: connection.outgoingTail = nil
-      let stopped = connection.closing or connection.failed
-      release(connection.lock)
-      if outgoing == nil: break
-      let text = localText(outgoing.text)
-      freeText(outgoing.text)
-      deallocShared(outgoing)
-      if stopped: continue
-      var position = 0
-      while position < text.len and not connection.isStopped():
-        var fd = TPollfd(fd: connection.outputFd, events: POLLOUT)
-        let ready = posix.poll(addr fd, 1, IoPollMs)
+  proc writerThread(connection: Connection) {.thread.} =
+    ## Serialize outgoing messages and stop even when the peer stops reading.
+    blockSigpipe()
+    try:
+      while true:
+        acquire(connection.lock)
+        while connection.outgoingHead == nil and not connection.closing and not connection.failed:
+          wait(connection.changed, connection.lock)
+        let outgoing = connection.outgoingHead
+        if outgoing != nil:
+          connection.outgoingHead = outgoing.next
+          if connection.outgoingHead == nil: connection.outgoingTail = nil
+        let stopped = connection.closing or connection.failed
+        release(connection.lock)
+        if outgoing == nil: break
+        let text = localText(outgoing.text)
+        freeText(outgoing.text)
+        deallocShared(outgoing)
+        if stopped: continue
+        var position = 0
+        while position < text.len and not connection.isStopped():
+          var fd = TPollfd(fd: connection.outputFd, events: POLLOUT)
+          let ready = posix.poll(addr fd, 1, IoPollMs)
+          if ready < 0:
+            if errno == EINTR: continue
+            raiseOSError(osLastError())
+          if ready == 0: continue
+          let count = posix.write(connection.outputFd, unsafeAddr text[position], text.len - position)
+          if count < 0:
+            if errno in [EAGAIN, EINTR]: continue
+            raiseOSError(osLastError())
+          position += count
+    except CatchableError as error:
+      connection.fail(error.msg)
+
+  proc readerThread(connection: Connection) {.thread.} =
+    ## Incrementally frame stdout and independently drain stderr.
+    try:
+      var
+        pending = ""
+        errorFd = connection.errorFd
+      while not connection.isStopped():
+        var descriptors = [TPollfd(fd: connection.inputFd, events: POLLIN),
+          TPollfd(fd: errorFd, events: POLLIN)]
+        let ready = posix.poll(addr descriptors[0], 2, IoPollMs)
         if ready < 0:
           if errno == EINTR: continue
           raiseOSError(osLastError())
         if ready == 0: continue
-        let count = posix.write(connection.outputFd, unsafeAddr text[position], text.len - position)
-        if count < 0:
-          if errno in [EAGAIN, EINTR]: continue
-          raiseOSError(osLastError())
-        position += count
-  except CatchableError as error:
-    connection.fail(error.msg)
-
-proc readerThread(connection: Connection) {.thread.} =
-  ## Incrementally frame stdout and independently drain stderr.
-  try:
-    var
-      pending = ""
-      errorFd = connection.errorFd
-    while not connection.isStopped():
-      var descriptors = [TPollfd(fd: connection.inputFd, events: POLLIN),
-        TPollfd(fd: errorFd, events: POLLIN)]
-      let ready = posix.poll(addr descriptors[0], 2, IoPollMs)
-      if ready < 0:
-        if errno == EINTR: continue
-        raiseOSError(osLastError())
-      if ready == 0: continue
-      for i in 0 .. 1:
-        if descriptors[i].revents == 0: continue
-        var buffer = newString(ReadBufferSize)
-        let count = posix.read(descriptors[i].fd, addr buffer[0], buffer.len)
-        if count < 0:
-          if errno in [EAGAIN, EINTR]: continue
-          raiseOSError(osLastError())
-        if count == 0:
-          if i == 0:
-            connection.fail(if pending.len > 0: "EOF inside ACP message" else: "Peer closed stdout",
-              pending.len > 0)
-            return
-          errorFd = -1
-          continue
-        buffer.setLen(count)
-        if i == 1:
-          if connection.logHandler != nil: connection.queueEvent("$/stderr", buffer)
-        else:
-          pending.add(buffer)
-          var start = 0
-          for position in 0 ..< pending.len:
-            if pending[position] == '\n':
-              if connection.maxMessageBytes > 0 and position - start > connection.maxMessageBytes:
-                raise newException(AcpProtocolError, "ACP message exceeds configured byte limit")
-              connection.handleLine(pending[start ..< position])
-              start = position + 1
-          if start > 0: pending = pending[start .. ^1]
-          if connection.maxMessageBytes > 0 and pending.len > connection.maxMessageBytes:
-            raise newException(AcpProtocolError, "ACP message exceeds configured byte limit")
-  except CatchableError as error:
-    connection.fail(error.msg, error of AcpProtocolError or error of AcpRpcError)
+        for i in 0 .. 1:
+          if descriptors[i].revents == 0: continue
+          var buffer = newString(ReadBufferSize)
+          let count = posix.read(descriptors[i].fd, addr buffer[0], buffer.len)
+          if count < 0:
+            if errno in [EAGAIN, EINTR]: continue
+            raiseOSError(osLastError())
+          if count == 0:
+            if i == 0:
+              connection.fail(if pending.len > 0: "EOF inside ACP message" else: "Peer closed stdout",
+                pending.len > 0)
+              return
+            errorFd = -1
+            continue
+          buffer.setLen(count)
+          if i == 1:
+            if connection.logHandler != nil: connection.queueEvent("$/stderr", buffer)
+          else:
+            pending.add(buffer)
+            var start = 0
+            for position in 0 ..< pending.len:
+              if pending[position] == '\n':
+                if connection.maxMessageBytes > 0 and position - start > connection.maxMessageBytes:
+                  raise newException(AcpProtocolError, "ACP message exceeds configured byte limit")
+                connection.handleLine(pending[start ..< position])
+                start = position + 1
+            if start > 0: pending = pending[start .. ^1]
+            if connection.maxMessageBytes > 0 and pending.len > connection.maxMessageBytes:
+              raise newException(AcpProtocolError, "ACP message exceeds configured byte limit")
+    except CatchableError as error:
+      connection.fail(error.msg, error of AcpProtocolError or error of AcpRpcError)
 
 proc notifierThread(connection: Connection) {.thread.} =
   ## Deliver ordered callbacks without running application code on the I/O thread.
@@ -1075,35 +1106,92 @@ proc newConnection*(inputFd, outputFd: cint, requestHandler: RequestHandler,
     notificationHandler: NotificationHandler, userData: pointer = nil,
     errorFd: cint = -1, logHandler: LogHandler = nil,
     workerThreads = DefaultWorkerThreads, maxMessageBytes = 0, maxQueuedBytes = 0): Connection =
-  ## Start a Linux stdio connection over caller-owned file descriptors.
-  if workerThreads < 1: raise newException(ValueError, "At least one request worker is required")
+  ## Starts POSIX descriptor I/O; other platforms use caller-driven transport.
+  when not defined(posix):
+    raise newException(OSError,
+      "Descriptor connections require POSIX; use newDrivenConnection.")
+  else:
+    if workerThreads < 1: raise newException(ValueError, "At least one request worker is required")
+    if maxMessageBytes < 0 or maxQueuedBytes < 0:
+      raise newException(ValueError, "Transport byte limits cannot be negative")
+    result = cast[Connection](allocShared0(sizeof(ConnectionObj)))
+    initLock(result.lock)
+    initCond(result.changed)
+    result.references = 1
+    result.inputFd = inputFd
+    result.outputFd = outputFd
+    result.errorFd = errorFd
+    result.requestHandler = requestHandler
+    result.notificationHandler = notificationHandler
+    result.logHandler = logHandler
+    result.userData = userData
+    result.maxMessageBytes = maxMessageBytes
+    result.maxQueuedBytes = maxQueuedBytes
+    var
+      notifierStarted, writerStarted, managerStarted: bool
+      flagsChanged = 0
+    try:
+      for index, fd in [inputFd, outputFd, errorFd]:
+        result.originalFlags[index] = -1
+        if fd >= 0:
+          let flags = fcntl(fd, F_GETFL)
+          if flags < 0: raiseOSError(osLastError())
+          result.originalFlags[index] = flags
+          if fcntl(fd, F_SETFL, flags or O_NONBLOCK) < 0: raiseOSError(osLastError())
+        inc flagsChanged
+      result.workers = cast[ptr UncheckedArray[Thread[Connection]]](
+        allocShared0(workerThreads * sizeof(Thread[Connection])))
+      for i in 0 ..< workerThreads:
+        createThread(result.workers[i], workerThread, result)
+        inc result.workerCount
+      createThread(result.manager, managementThread, result)
+      managerStarted = true
+      createThread(result.notifier, notifierThread, result)
+      notifierStarted = true
+      createThread(result.writer, writerThread, result)
+      writerStarted = true
+      result.writerStarted = true
+      createThread(result.reader, readerThread, result)
+      result.readerStarted = true
+    except CatchableError:
+      withLock result.lock:
+        result.closing = true
+        broadcast(result.changed)
+      if writerStarted: joinThread(result.writer)
+      if notifierStarted: joinThread(result.notifier)
+      if managerStarted: joinThread(result.manager)
+      for i in 0 ..< result.workerCount: joinThread(result.workers[i])
+      for index, fd in [inputFd, outputFd, errorFd]:
+        if index < flagsChanged and fd >= 0: discard fcntl(fd, F_SETFL, result.originalFlags[index])
+      result.release()
+      raise
+
+proc newDrivenConnection*(requestHandler: RequestHandler,
+    notificationHandler: NotificationHandler, userData: pointer = nil,
+    logHandler: LogHandler = nil, workerThreads = 1,
+    maxMessageBytes = 0, maxQueuedBytes = 0): Connection =
+  ## Starts shared RPC dispatch with caller-owned byte I/O.
+  ## Zero disables optional byte limits, matching descriptor-owned connections.
+  if workerThreads < 1:
+    raise newException(ValueError, "At least one request worker is required")
   if maxMessageBytes < 0 or maxQueuedBytes < 0:
     raise newException(ValueError, "Transport byte limits cannot be negative")
   result = cast[Connection](allocShared0(sizeof(ConnectionObj)))
   initLock(result.lock)
   initCond(result.changed)
   result.references = 1
-  result.inputFd = inputFd
-  result.outputFd = outputFd
-  result.errorFd = errorFd
+  result.driven = true
+  result.inputFd = -1
+  result.outputFd = -1
+  result.errorFd = -1
   result.requestHandler = requestHandler
   result.notificationHandler = notificationHandler
   result.logHandler = logHandler
   result.userData = userData
   result.maxMessageBytes = maxMessageBytes
   result.maxQueuedBytes = maxQueuedBytes
-  var
-    notifierStarted, writerStarted, managerStarted: bool
-    flagsChanged = 0
+  var notifierStarted, managerStarted: bool
   try:
-    for index, fd in [inputFd, outputFd, errorFd]:
-      result.originalFlags[index] = -1
-      if fd >= 0:
-        let flags = fcntl(fd, F_GETFL)
-        if flags < 0: raiseOSError(osLastError())
-        result.originalFlags[index] = flags
-        if fcntl(fd, F_SETFL, flags or O_NONBLOCK) < 0: raiseOSError(osLastError())
-      inc flagsChanged
     result.workers = cast[ptr UncheckedArray[Thread[Connection]]](
       allocShared0(workerThreads * sizeof(Thread[Connection])))
     for i in 0 ..< workerThreads:
@@ -1113,21 +1201,89 @@ proc newConnection*(inputFd, outputFd: cint, requestHandler: RequestHandler,
     managerStarted = true
     createThread(result.notifier, notifierThread, result)
     notifierStarted = true
-    createThread(result.writer, writerThread, result)
-    writerStarted = true
-    createThread(result.reader, readerThread, result)
   except CatchableError:
     withLock result.lock:
       result.closing = true
       broadcast(result.changed)
-    if writerStarted: joinThread(result.writer)
     if notifierStarted: joinThread(result.notifier)
     if managerStarted: joinThread(result.manager)
     for i in 0 ..< result.workerCount: joinThread(result.workers[i])
-    for index, fd in [inputFd, outputFd, errorFd]:
-      if index < flagsChanged and fd >= 0: discard fcntl(fd, F_SETFL, result.originalFlags[index])
     result.release()
     raise
+
+proc requireDriven(connection: Connection) =
+  ## Rejects byte-pump operations on descriptor-owned or closed connections.
+  if not connection.driven:
+    raise newException(ValueError, "This connection owns its descriptor I/O")
+  withLock connection.lock:
+    if connection.closing or connection.failed:
+      raise newException(AcpTransportError,
+        if connection.failure != nil: localText(connection.failure)
+        else: "Connection is closed")
+
+proc feed*(connection: Connection, bytes: string) =
+  ## Accepts fragmented NDJSON on the transport owner thread without doing I/O.
+  ## Explicit callback bounds fail instead of blocking the transport owner.
+  connection.requireDriven()
+  var pending = localText(connection.inputPending)
+  freeText(connection.inputPending)
+  connection.inputPending = nil
+  try:
+    var start = 0
+    for position in 0 ..< bytes.len:
+      if bytes[position] == '\n':
+        if connection.maxMessageBytes > 0 and
+          position - start > connection.maxMessageBytes - pending.len:
+            raise newException(AcpProtocolError,
+              "ACP message exceeds configured byte limit")
+        pending.add(bytes[start ..< position])
+        connection.handleLine(pending)
+        pending.setLen(0)
+        start = position + 1
+    if connection.maxMessageBytes > 0 and
+      bytes.len - start > connection.maxMessageBytes - pending.len:
+        raise newException(AcpProtocolError,
+          "ACP message exceeds configured byte limit")
+    pending.add(bytes[start ..< bytes.len])
+    if pending.len > 0:
+      connection.inputPending = sharedText(pending)
+  except CatchableError as error:
+    connection.fail(error.msg, error of AcpProtocolError or error of AcpRpcError)
+    raise
+
+proc takeOutgoing*(connection: Connection): string =
+  ## Drains complete NDJSON frames for delivery by the transport owner thread.
+  ## The caller retains returned bytes until its transport has accepted them.
+  connection.requireDriven()
+  withLock connection.lock:
+    var outgoing = connection.outgoingHead
+    while outgoing != nil:
+      let next = outgoing.next
+      result.add(localText(outgoing.text))
+      freeText(outgoing.text)
+      deallocShared(outgoing)
+      outgoing = next
+    connection.outgoingHead = nil
+    connection.outgoingTail = nil
+
+proc feedError*(connection: Connection, bytes: string) =
+  ## Forwards optional transport diagnostics through the ordered log callback.
+  connection.requireDriven()
+  if bytes.len > 0 and connection.logHandler != nil:
+    try:
+      connection.queueEvent("$/stderr", bytes)
+    except CatchableError as error:
+      connection.fail(error.msg, error of AcpProtocolError or error of AcpRpcError)
+      raise
+
+proc endInput*(connection: Connection) =
+  ## Reports peer EOF separately from an empty, temporarily idle read.
+  connection.requireDriven()
+  let partial = connection.inputPending != nil
+  connection.fail(
+    if partial: "EOF inside ACP message" else: "Peer closed the byte stream",
+    partial
+  )
 
 proc waitClosed*(connection: Connection) =
   ## Block until EOF, a transport failure, or an explicit close request.
@@ -1146,8 +1302,8 @@ proc close*(connection: Connection) =
       task.cancelled = true
       task = task.activeNext
     broadcast(connection.changed)
-  joinThread(connection.reader)
-  joinThread(connection.writer)
+  if connection.readerStarted: joinThread(connection.reader)
+  if connection.writerStarted: joinThread(connection.writer)
   joinThread(connection.notifier)
   joinThread(connection.manager)
   for i in 0 ..< connection.workerCount: joinThread(connection.workers[i])
@@ -1161,6 +1317,15 @@ proc close*(connection: Connection) =
         dec connection.references
       else:
         link = addr pending.next
-  for index, fd in [connection.inputFd, connection.outputFd, connection.errorFd]:
-    if fd >= 0: discard fcntl(fd, F_SETFL, connection.originalFlags[index])
+  when defined(posix):
+    for index, fd in [connection.inputFd, connection.outputFd, connection.errorFd]:
+      if fd >= 0: discard fcntl(fd, F_SETFL, connection.originalFlags[index])
+  var outgoing = connection.outgoingHead
+  while outgoing != nil:
+    let next = outgoing.next
+    freeText(outgoing.text)
+    deallocShared(outgoing)
+    outgoing = next
+  connection.outgoingHead = nil
+  connection.outgoingTail = nil
   connection.release()

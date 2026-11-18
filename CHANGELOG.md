@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Add caller-driven byte connections using the existing threaded RPC engine.
+- Expose portable protocol codecs and the POSIX driven client API without
+  requiring local process launch.
+- Keep driven messages and queues unlimited by default, matching stdio.
+- Reject local terminal authentication for process-free clients.
+
 ## 1.3.0
 
 - Add callback-backed filesystem and terminal requests in both protocol roles,

@@ -1,4 +1,4 @@
-.PHONY: setup check test test-arc test-orc integration-setup integration-test integration-test-codex integration-test-grok integration-test-claude examples build/fixture-agent build/raw-agent build/session-agent build/features-agent build/features-raw build/coverage-agent build/coverage-raw
+.PHONY: setup check test test-driven test-arc test-orc integration-setup integration-test integration-test-codex integration-test-grok integration-test-claude examples build/fixture-agent build/raw-agent build/session-agent build/features-agent build/features-raw build/coverage-agent build/coverage-raw
 
 NIM ?= nim
 
@@ -36,7 +36,12 @@ build/coverage-raw: tests/fixtures/coverage_raw.nim
 	mkdir -p build
 	$(NIM) c --out:$@ $<
 
-test: build/fixture-agent build/raw-agent build/session-agent build/features-agent build/features-raw build/coverage-agent build/coverage-raw build/agent-relay
+test-driven:
+	mkdir -p build
+	$(NIM) r --out:build/test_driven tests/test_driven.nim
+	$(NIM) r --out:build/test_driven_api tests/test_driven_api.nim
+
+test: build/fixture-agent build/raw-agent build/session-agent build/features-agent build/features-raw build/coverage-agent build/coverage-raw build/agent-relay test-driven
 	$(NIM) r --out:build/test_protocol tests/test_protocol.nim
 	$(NIM) r --out:build/test_stdio tests/test_stdio.nim
 	$(NIM) r --out:build/test_sessions tests/test_sessions.nim
