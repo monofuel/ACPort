@@ -127,6 +127,61 @@ proc testDrivenRequests() =
     "\"method\":\"not_supported\",\"params\":{}}\n")
   doAssert peer.waitOutput()["error"]["code"].getInt() == MethodNotFound
 
+type TimedResponse = object
+  peer: Connection
+  frame: SharedText
+
+proc delayedResponse(response: ptr TimedResponse) {.thread.} =
+  ## Wakes a blocking request through the portable connection condition.
+  sleep(20)
+  response.peer.feed(localText(response.frame))
+
+proc testTimedRequests() =
+  ## Verifies native condition wakeups, timeout expiry, and later responses.
+  echo "Testing driven timed request waits"
+  let peer = newDrivenConnection(nil, nil)
+  defer: peer.close()
+  let
+    pending = peer.startRequest("_request", %*{})
+    request = parseJson(peer.takeOutgoing().strip())
+  var response = TimedResponse(
+    peer: peer,
+    frame: sharedText($( %*{
+      "jsonrpc": "2.0", "id": request["id"], "result": {"done": true}
+    }) & "\n")
+  )
+  var thread: Thread[ptr TimedResponse]
+  createThread(thread, delayedResponse, addr response)
+  try:
+    doAssert pending.waitResponse(2000)["done"].getBool()
+  finally:
+    joinThread(thread)
+    freeText(response.frame)
+  let
+    expired = peer.startRequest("_expired", %*{})
+    late = parseJson(peer.takeOutgoing().strip())
+    started = getMonoTime()
+  var timedOut = false
+  try:
+    discard expired.waitResponse(20)
+  except AcpTimeoutError:
+    timedOut = true
+  doAssert timedOut
+  doAssert (getMonoTime() - started).inMilliseconds >= 20
+  doAssert (getMonoTime() - started).inSeconds < 5
+  doAssert parseJson(peer.takeOutgoing().strip())["method"].getStr() ==
+    "$/cancel_request"
+  peer.feed($( %*{
+    "jsonrpc": "2.0", "id": late["id"], "result": {}
+  }) & "\n")
+  when not defined(posix):
+    var unsupported = false
+    try:
+      discard newConnection(0, 1, nil, nil)
+    except OSError:
+      unsupported = true
+    doAssert unsupported
+
 proc testCallbackBarrier() =
   ## Keeps a response pending until preceding update callbacks are delivered.
   echo "Testing driven callback ordering"
@@ -308,6 +363,7 @@ proc testLimitsAndParseErrors() =
     doAssert bounded
 
 testDrivenRequests()
+testTimedRequests()
 testCallbackBarrier()
 testCancellation()
 testEofAndClose()
